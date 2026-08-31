@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# cla — scegli un progetto sotto ~/git e avviaci claude dentro.
+set -euo pipefail
+
+GIT_DIR="$HOME/git"
+
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+CYAN=$'\033[36m'
+MAGENTA=$'\033[35m'
+YELLOW=$'\033[33m'
+GREEN=$'\033[32m'
+
+cd "$GIT_DIR"
+
+projects=()
+for d in */; do
+    d="${d%/}"
+    [[ "$d" == .* ]] && continue
+    projects+=("$d")
+done
+
+if [ ${#projects[@]} -eq 0 ]; then
+    echo -e "${YELLOW}Nessun progetto trovato in $GIT_DIR${RESET}"
+    exit 1
+fi
+
+# Colore /color deterministico dal nome progetto: stesso progetto, stesso colore ogni volta.
+PALETTE=(red blue green yellow purple orange pink cyan)
+project_color() {
+    local name="$1" sum=0 i c
+    for (( i=0; i<${#name}; i++ )); do
+        c="${name:i:1}"
+        sum=$(( sum + $(printf '%d' "'$c") ))
+    done
+    echo "${PALETTE[$(( sum % ${#PALETTE[@]} ))]}"
+}
+
+launch_claude() {
+    local project="$1" color
+    color="$(project_color "$project")"
+    cd "$GIT_DIR/$project"
+    echo -e "\n${GREEN}${BOLD}➜ Avvio claude in${RESET} ${CYAN}$(pwd)${RESET} ${DIM}(colore ${color}, remote control attivo)${RESET}\n"
+    exec claude --remote-control "$project" -n "$project" "/color $color"
+}
+
+banner() {
+    echo -e "${MAGENTA}${BOLD}"
+    cat <<'EOF'
+ ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗
+██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝
+██║     ██║     ███████║██║   ██║██║  ██║█████╗
+██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝
+╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗
+ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝
+EOF
+    echo -e "${RESET}${DIM}  ~/git · scegli un progetto${RESET}\n"
+}
+
+# Tasti rapidi per la selezione diretta: 1-9 poi lettere (esclusa 'q', riservata per uscire).
+keys="123456789abcdefghijklmnoprstuvwxyz"
+quickkeys=()
+for i in "${!projects[@]}"; do
+    if [ "$i" -lt "${#keys}" ]; then
+        quickkeys+=("${keys:$i:1}")
+    else
+        quickkeys+=("")
+    fi
+done
+
+# Se non c'e' un terminale interattivo (piped/redirect), fallback a select classico.
+if [ ! -t 0 ]; then
+    banner
+    PS3="Scegli un progetto: "
+    select project in "${projects[@]}"; do
+        [ -n "${project:-}" ] && break
+        echo "Scelta non valida."
+    done
+    launch_claude "$project"
+fi
+
+selected=0
+count=${#projects[@]}
+
+draw_menu() {
+    for i in "${!projects[@]}"; do
+        key_label="${quickkeys[$i]:--}"
+        if [ "$i" -eq "$selected" ]; then
+            echo -e "  ${CYAN}${BOLD}❯ ${YELLOW}${key_label}${RESET}  ${CYAN}${BOLD}${projects[$i]}${RESET}"
+        else
+            echo -e "    ${DIM}${key_label}  ${projects[$i]}${RESET}"
+        fi
+    done
+}
+
+tput civis
+trap 'tput cnorm' EXIT
+
+banner
+echo -e "${DIM}  ↑/↓ per muoverti · invio per confermare · numero/lettera per scelta rapida · q per uscire${RESET}\n"
+draw_menu
+
+while true; do
+    IFS= read -rsn1 key
+
+    if [[ $key == $'\x1b' ]]; then
+        read -rsn2 key
+        case "$key" in
+            '[A') selected=$(( (selected - 1 + count) % count )) ;;
+            '[B') selected=$(( (selected + 1) % count )) ;;
+        esac
+    elif [[ -z $key ]]; then
+        break
+    else
+        key="${key,,}"
+        if [[ $key == "q" ]]; then
+            tput cnorm
+            exit 0
+        fi
+        match=-1
+        for i in "${!quickkeys[@]}"; do
+            if [[ -n "${quickkeys[$i]}" && "${quickkeys[$i]}" == "$key" ]]; then
+                match=$i
+                break
+            fi
+        done
+        if [ "$match" -ge 0 ]; then
+            selected=$match
+            break
+        fi
+    fi
+
+    tput cuu "$count"
+    draw_menu
+done
+
+tput cnorm
+
+launch_claude "${projects[$selected]}"
