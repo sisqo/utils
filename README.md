@@ -1,6 +1,14 @@
 # utils
 
-A personal collection of small scripts and command-line utilities.
+Every developer ends up with a personal drawer of small tools — the ones you
+reach for without thinking, that never make it into a client's codebase but
+save you five minutes a dozen times a day. This is mine: a growing collection
+of scripts I actually use, kept in one place so a new machine is one
+`git clone` away from feeling like home.
+
+No frameworks, no dependencies to speak of — just plain, self-contained
+scripts built to be dropped on the `PATH` and forgotten about until they're
+needed again.
 
 ## Layout
 
