@@ -42,7 +42,8 @@ launch_claude() {
     color="$(project_color "$project")"
     cd "$GIT_DIR/$project"
     echo -e "\n${GREEN}${BOLD}➜ Avvio claude in${RESET} ${CYAN}$(pwd)${RESET} ${DIM}(colore ${color}, remote control attivo)${RESET}\n"
-    exec claude --remote-control "$project" -n "$project" "/color $color"
+    # Path assoluto: i bind exec di Hyprland non ereditano ~/.local/bin nel PATH.
+    exec /home/user/.local/bin/claude --remote-control "$project" -n "$project" "/color $color"
 }
 
 banner() {
