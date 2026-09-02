@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# cla — scegli un progetto sotto ~/git e avviaci claude dentro.
+# cla — scegli un progetto (cartella corrente, o una sotto ~/git) e avviaci claude dentro.
 set -euo pipefail
 
 GIT_DIR="$HOME/git"
+CURRENT_DIR="$(pwd)"
 
 RESET=$'\033[0m'
 BOLD=$'\033[1m'
@@ -14,17 +15,19 @@ GREEN=$'\033[32m'
 
 cd "$GIT_DIR"
 
-projects=()
+# La prima scelta e' sempre la cartella corrente (da cui e' stato lanciato cla);
+# tutte le altre sono le cartelle sotto ~/git.
+names=("$(basename "$CURRENT_DIR")")
+paths=("$CURRENT_DIR")
+
 for d in */; do
     d="${d%/}"
     [[ "$d" == .* ]] && continue
-    projects+=("$d")
+    full="$GIT_DIR/$d"
+    [[ "$full" == "$CURRENT_DIR" ]] && continue
+    names+=("$d")
+    paths+=("$full")
 done
-
-if [ ${#projects[@]} -eq 0 ]; then
-    echo -e "${YELLOW}Nessun progetto trovato in $GIT_DIR${RESET}"
-    exit 1
-fi
 
 # Colore /color deterministico dal nome progetto: stesso progetto, stesso colore ogni volta.
 PALETTE=(red blue green yellow purple orange pink cyan)
@@ -38,12 +41,20 @@ project_color() {
 }
 
 launch_claude() {
-    local project="$1" color
-    color="$(project_color "$project")"
-    cd "$GIT_DIR/$project"
+    local path="$1" name="$2" color rename_text
+    # Il colore resta legato al nome della cartella, non al nome scelto per la
+    # sessione: stesso progetto, stesso colore ogni volta.
+    color="$(project_color "$name")"
+
+    # La CLI di claude accetta un solo prompt iniziale, gia' occupato da
+    # "/color": il nome sessione (equivalente a /rename) si imposta con -n.
+    read -e -r -i "$name" -p "Rinomina sessione: " rename_text || true
+    rename_text="${rename_text:-$name}"
+
+    cd "$path"
     echo -e "\n${GREEN}${BOLD}➜ Avvio claude in${RESET} ${CYAN}$(pwd)${RESET} ${DIM}(colore ${color}, remote control attivo)${RESET}\n"
     # Path assoluto: i bind exec di Hyprland non ereditano ~/.local/bin nel PATH.
-    exec /home/user/.local/bin/claude --remote-control "$project" -n "$project" "/color $color"
+    exec /home/user/.local/bin/claude --remote-control "$rename_text" -n "$rename_text" "/color $color"
 }
 
 banner() {
@@ -62,7 +73,7 @@ EOF
 # Tasti rapidi per la selezione diretta: 1-9 poi lettere (esclusa 'q', riservata per uscire).
 keys="123456789abcdefghijklmnoprstuvwxyz"
 quickkeys=()
-for i in "${!projects[@]}"; do
+for i in "${!names[@]}"; do
     if [ "$i" -lt "${#keys}" ]; then
         quickkeys+=("${keys:$i:1}")
     else
@@ -74,23 +85,26 @@ done
 if [ ! -t 0 ]; then
     banner
     PS3="Scegli un progetto: "
-    select project in "${projects[@]}"; do
-        [ -n "${project:-}" ] && break
+    select name in "${names[@]}"; do
+        [ -n "${name:-}" ] && break
         echo "Scelta non valida."
     done
-    launch_claude "$project"
+    idx=$((REPLY - 1))
+    launch_claude "${paths[$idx]}" "${names[$idx]}"
 fi
 
 selected=0
-count=${#projects[@]}
+count=${#names[@]}
 
 draw_menu() {
-    for i in "${!projects[@]}"; do
+    for i in "${!names[@]}"; do
         key_label="${quickkeys[$i]:--}"
+        label="${names[$i]}"
+        [ "$i" -eq 0 ] && label="${label} ${DIM}(cartella corrente)${RESET}"
         if [ "$i" -eq "$selected" ]; then
-            echo -e "  ${CYAN}${BOLD}❯ ${YELLOW}${key_label}${RESET}  ${CYAN}${BOLD}${projects[$i]}${RESET}"
+            echo -e "  ${CYAN}${BOLD}❯ ${YELLOW}${key_label}${RESET}  ${CYAN}${BOLD}${label}${RESET}"
         else
-            echo -e "    ${DIM}${key_label}  ${projects[$i]}${RESET}"
+            echo -e "    ${DIM}${key_label}  ${label}${RESET}"
         fi
     done
 }
@@ -138,4 +152,4 @@ done
 
 tput cnorm
 
-launch_claude "${projects[$selected]}"
+launch_claude "${paths[$selected]}" "${names[$selected]}"
