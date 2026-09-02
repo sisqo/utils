@@ -52,6 +52,12 @@ launch_claude() {
     rename_text="${rename_text:-$name}"
 
     cd "$path"
+
+    if git rev-parse --is-inside-work-tree &>/dev/null; then
+        echo -e "${DIM}  git pull...${RESET}"
+        git pull --ff-only || echo -e "${YELLOW}  Attenzione: git pull fallito, procedo comunque${RESET}"
+    fi
+
     echo -e "\n${GREEN}${BOLD}➜ Avvio claude in${RESET} ${CYAN}$(pwd)${RESET} ${DIM}(colore ${color}, remote control attivo)${RESET}\n"
     # Path assoluto: i bind exec di Hyprland non ereditano ~/.local/bin nel PATH.
     exec /home/user/.local/bin/claude --remote-control "$rename_text" -n "$rename_text" "/color $color"
