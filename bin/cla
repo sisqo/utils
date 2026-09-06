@@ -2,6 +2,9 @@
 # cla — scegli un progetto (cartella corrente, o una sotto ~/git) e avviaci claude dentro.
 set -euo pipefail
 
+# Stato iniziale del toggle nel menu: si cambia con "r" prima di confermare.
+REMOTE_CONTROL=true
+
 GIT_DIR="$HOME/git"
 CURRENT_DIR="$(pwd)"
 
@@ -12,6 +15,7 @@ CYAN=$'\033[36m'
 MAGENTA=$'\033[35m'
 YELLOW=$'\033[33m'
 GREEN=$'\033[32m'
+CLEAR_EOL=$'\033[K'
 
 cd "$GIT_DIR"
 
@@ -41,7 +45,8 @@ project_color() {
 }
 
 launch_claude() {
-    local path="$1" name="$2" color rename_text
+    local path="$1" name="$2" color rename_text rc_label
+    local claude_args=()
     # Il colore resta legato al nome della cartella, non al nome scelto per la
     # sessione: stesso progetto, stesso colore ogni volta.
     color="$(project_color "$name")"
@@ -51,6 +56,13 @@ launch_claude() {
     read -e -r -i "$name" -p "Rinomina sessione: " rename_text || true
     rename_text="${rename_text:-$name}"
 
+    if [ "$REMOTE_CONTROL" = true ]; then
+        claude_args+=(--remote-control "$rename_text")
+        rc_label="remote control attivo"
+    else
+        rc_label="remote control disattivato"
+    fi
+
     cd "$path"
 
     if git rev-parse --is-inside-work-tree &>/dev/null; then
@@ -58,9 +70,9 @@ launch_claude() {
         git pull --ff-only || echo -e "${YELLOW}  Attenzione: git pull fallito, procedo comunque${RESET}"
     fi
 
-    echo -e "\n${GREEN}${BOLD}➜ Avvio claude in${RESET} ${CYAN}$(pwd)${RESET} ${DIM}(colore ${color}, remote control attivo)${RESET}\n"
+    echo -e "\n${GREEN}${BOLD}➜ Avvio claude in${RESET} ${CYAN}$(pwd)${RESET} ${DIM}(colore ${color}, ${rc_label})${RESET}\n"
     # Path assoluto: i bind exec di Hyprland non ereditano ~/.local/bin nel PATH.
-    exec /home/user/.local/bin/claude --remote-control "$rename_text" -n "$rename_text" "/color $color"
+    exec /home/user/.local/bin/claude "${claude_args[@]}" -n "$rename_text" "/color $color"
 }
 
 banner() {
@@ -76,8 +88,9 @@ EOF
     echo -e "${RESET}${DIM}  ~/git · scegli un progetto${RESET}\n"
 }
 
-# Tasti rapidi per la selezione diretta: 1-9 poi lettere (esclusa 'q', riservata per uscire).
-keys="123456789abcdefghijklmnoprstuvwxyz"
+# Tasti rapidi per la selezione diretta: 1-9 poi lettere ('q' e 'r' escluse,
+# riservate per uscire e per il toggle del remote control).
+keys="123456789abcdefghijklmnopstuvwxyz"
 quickkeys=()
 for i in "${!names[@]}"; do
     if [ "$i" -lt "${#keys}" ]; then
@@ -101,6 +114,7 @@ fi
 
 selected=0
 count=${#names[@]}
+menu_lines=$(( count + 2 ))
 
 draw_menu() {
     for i in "${!names[@]}"; do
@@ -108,18 +122,26 @@ draw_menu() {
         label="${names[$i]}"
         [ "$i" -eq 0 ] && label="${label} ${DIM}(cartella corrente)${RESET}"
         if [ "$i" -eq "$selected" ]; then
-            echo -e "  ${CYAN}${BOLD}❯ ${YELLOW}${key_label}${RESET}  ${CYAN}${BOLD}${label}${RESET}"
+            echo -e "  ${CYAN}${BOLD}❯ ${YELLOW}${key_label}${RESET}  ${CYAN}${BOLD}${label}${RESET}${CLEAR_EOL}"
         else
-            echo -e "    ${DIM}${key_label}  ${label}${RESET}"
+            echo -e "    ${DIM}${key_label}  ${label}${RESET}${CLEAR_EOL}"
         fi
     done
+    echo -e "${CLEAR_EOL}"
+    if [ "$REMOTE_CONTROL" = true ]; then
+        echo -e "  ${DIM}remote control${RESET}  ${GREEN}${BOLD}● ON${RESET}   ${DIM}· r per cambiare${RESET}${CLEAR_EOL}"
+    else
+        echo -e "  ${DIM}remote control${RESET}  ${DIM}○ OFF${RESET}  ${DIM}· r per cambiare${RESET}${CLEAR_EOL}"
+    fi
 }
 
+# Il blocco ridisegnato (voci + riga vuota + stato) deve stare nello schermo:
+# tput cuu non risale oltre il bordo, e se scrolla il menu si sfarina.
 tput civis
 trap 'tput cnorm' EXIT
 
 banner
-echo -e "${DIM}  ↑/↓ per muoverti · invio per confermare · numero/lettera per scelta rapida · q per uscire${RESET}\n"
+echo -e "${DIM}  ↑/↓ per muoverti · invio per confermare · numero/lettera per scelta rapida · r per il remote control · q per uscire${RESET}\n"
 draw_menu
 
 while true; do
@@ -139,6 +161,13 @@ while true; do
             tput cnorm
             exit 0
         fi
+        if [[ $key == "r" ]]; then
+            if [ "$REMOTE_CONTROL" = true ]; then
+                REMOTE_CONTROL=false
+            else
+                REMOTE_CONTROL=true
+            fi
+        fi
         match=-1
         for i in "${!quickkeys[@]}"; do
             if [[ -n "${quickkeys[$i]}" && "${quickkeys[$i]}" == "$key" ]]; then
@@ -152,7 +181,7 @@ while true; do
         fi
     fi
 
-    tput cuu "$count"
+    tput cuu "$menu_lines"
     draw_menu
 done
 
