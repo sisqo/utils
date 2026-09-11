@@ -29,10 +29,11 @@ inside the one you choose.
 - Arrow keys (or a quick number/letter shortcut) to select a project, `q` to quit.
 - Assigns each project a deterministic color (derived from its name) and starts
   `claude` with that color and the project name as label.
-- `r` toggles Remote Control, shown as a status line under the list. It starts
-  on; the state at the moment you confirm is the one `claude` launches with.
-- Falls back to a plain `select` menu when stdin isn't a terminal (no toggle
-  there — Remote Control stays on).
+- `r` and `c` toggle Remote Control and the Claude in Chrome integration
+  (`--chrome`), each shown as a status line under the list. Both start on; the
+  state at the moment you confirm is the one `claude` launches with.
+- Falls back to a plain `select` menu when stdin isn't a terminal (no toggles
+  there — both stay on).
 
 Usage:
 

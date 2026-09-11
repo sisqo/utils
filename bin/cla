@@ -2,8 +2,9 @@
 # cla — scegli un progetto (cartella corrente, o una sotto ~/git) e avviaci claude dentro.
 set -euo pipefail
 
-# Stato iniziale del toggle nel menu: si cambia con "r" prima di confermare.
+# Stato iniziale dei toggle nel menu: si cambiano con "r" e "c" prima di confermare.
 REMOTE_CONTROL=true
+CHROME=true
 
 GIT_DIR="$HOME/git"
 CURRENT_DIR="$(pwd)"
@@ -45,7 +46,7 @@ project_color() {
 }
 
 launch_claude() {
-    local path="$1" name="$2" color rename_text rc_label
+    local path="$1" name="$2" color rename_text rc_label chrome_label
     local claude_args=()
     # Il colore resta legato al nome della cartella, non al nome scelto per la
     # sessione: stesso progetto, stesso colore ogni volta.
@@ -63,6 +64,13 @@ launch_claude() {
         rc_label="remote control disattivato"
     fi
 
+    if [ "$CHROME" = true ]; then
+        claude_args+=(--chrome)
+        chrome_label="chrome attivo"
+    else
+        chrome_label="chrome disattivato"
+    fi
+
     cd "$path"
 
     if git rev-parse --is-inside-work-tree &>/dev/null; then
@@ -70,7 +78,7 @@ launch_claude() {
         git pull --ff-only || echo -e "${YELLOW}  Attenzione: git pull fallito, procedo comunque${RESET}"
     fi
 
-    echo -e "\n${GREEN}${BOLD}➜ Avvio claude in${RESET} ${CYAN}$(pwd)${RESET} ${DIM}(colore ${color}, ${rc_label})${RESET}\n"
+    echo -e "\n${GREEN}${BOLD}➜ Avvio claude in${RESET} ${CYAN}$(pwd)${RESET} ${DIM}(colore ${color}, ${rc_label}, ${chrome_label})${RESET}\n"
     # Path assoluto: i bind exec di Hyprland non ereditano ~/.local/bin nel PATH.
     exec /home/user/.local/bin/claude "${claude_args[@]}" -n "$rename_text" "/color $color"
 }
@@ -88,9 +96,9 @@ EOF
     echo -e "${RESET}${DIM}  ~/git · scegli un progetto${RESET}\n"
 }
 
-# Tasti rapidi per la selezione diretta: 1-9 poi lettere ('q' e 'r' escluse,
-# riservate per uscire e per il toggle del remote control).
-keys="123456789abcdefghijklmnopstuvwxyz"
+# Tasti rapidi per la selezione diretta: 1-9 poi lettere ('q', 'r' e 'c' escluse,
+# riservate per uscire e per i toggle di remote control e chrome).
+keys="123456789abdefghijklmnopstuvwxyz"
 quickkeys=()
 for i in "${!names[@]}"; do
     if [ "$i" -lt "${#keys}" ]; then
@@ -114,7 +122,18 @@ fi
 
 selected=0
 count=${#names[@]}
-menu_lines=$(( count + 2 ))
+menu_lines=$(( count + 3 ))
+
+# Riga di stato di un toggle: etichetta allineata, pallino ON/OFF, tasto per cambiarlo.
+status_line() {
+    local label="$1" state="$2" key="$3"
+    label="$(printf '%-14s' "$label")"
+    if [ "$state" = true ]; then
+        echo -e "  ${DIM}${label}${RESET}  ${GREEN}${BOLD}● ON${RESET}   ${DIM}· ${key} per cambiare${RESET}${CLEAR_EOL}"
+    else
+        echo -e "  ${DIM}${label}${RESET}  ${DIM}○ OFF${RESET}  ${DIM}· ${key} per cambiare${RESET}${CLEAR_EOL}"
+    fi
+}
 
 draw_menu() {
     for i in "${!names[@]}"; do
@@ -128,20 +147,17 @@ draw_menu() {
         fi
     done
     echo -e "${CLEAR_EOL}"
-    if [ "$REMOTE_CONTROL" = true ]; then
-        echo -e "  ${DIM}remote control${RESET}  ${GREEN}${BOLD}● ON${RESET}   ${DIM}· r per cambiare${RESET}${CLEAR_EOL}"
-    else
-        echo -e "  ${DIM}remote control${RESET}  ${DIM}○ OFF${RESET}  ${DIM}· r per cambiare${RESET}${CLEAR_EOL}"
-    fi
+    status_line "remote control" "$REMOTE_CONTROL" r
+    status_line "chrome" "$CHROME" c
 }
 
-# Il blocco ridisegnato (voci + riga vuota + stato) deve stare nello schermo:
+# Il blocco ridisegnato (voci + riga vuota + righe di stato) deve stare nello schermo:
 # tput cuu non risale oltre il bordo, e se scrolla il menu si sfarina.
 tput civis
 trap 'tput cnorm' EXIT
 
 banner
-echo -e "${DIM}  ↑/↓ per muoverti · invio per confermare · numero/lettera per scelta rapida · r per il remote control · q per uscire${RESET}\n"
+echo -e "${DIM}  ↑/↓ per muoverti · invio per confermare · numero/lettera per scelta rapida · r/c per remote control e chrome · q per uscire${RESET}\n"
 draw_menu
 
 while true; do
@@ -166,6 +182,13 @@ while true; do
                 REMOTE_CONTROL=false
             else
                 REMOTE_CONTROL=true
+            fi
+        fi
+        if [[ $key == "c" ]]; then
+            if [ "$CHROME" = true ]; then
+                CHROME=false
+            else
+                CHROME=true
             fi
         fi
         match=-1
