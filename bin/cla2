@@ -550,7 +550,7 @@ refilter() {  # $1 progetto da tenere selezionato (opzionale)
 layout() {
     read -r ROWS COLS < <(stty size </dev/tty 2>/dev/null || echo "24 80")
     SHOW_BANNER=0; SHOW_SYS=0
-    if (( ROWS >= 24 && COLS >= BANNER_W + 4 )); then SHOW_BANNER=1; HDR_H=8; else HDR_H=2; fi
+    if (( ROWS >= 24 && COLS >= BANNER_W + 4 )); then SHOW_BANNER=1; HDR_H=9; else HDR_H=2; fi
     SX=$(( BANNER_W + 8 ))
     (( SHOW_BANNER && COLS >= SX + 28 )) && SHOW_SYS=1
     TOP=$(( HDR_H + 1 ))
@@ -581,6 +581,8 @@ draw_header() {
         F+="$E[2;1H$E[2K"
         return
     fi
+    # riga 1 vuota: il banner non sta attaccato al bordo superiore
+    F+="$E[1;1H$E[2K"
     for (( r=0; r<6; r++ )); do
         line=${BANNER[r]}; out=""
         for (( c=0; c<${#line}; c++ )); do
@@ -589,29 +591,29 @@ draw_header() {
             idx=$(( (c + r * 2 - PHASE + 48) % 48 ))
             if [[ $ch == '█' ]]; then out+="${GRAD[idx]}$ch"; else out+="${GRAD_DIM[idx]}$ch"; fi
         done
-        F+="$E[$(( r + 1 ));1H$E[2K  ${out}${RST}"
+        F+="$E[$(( r + 2 ));1H$E[2K  ${out}${RST}"
     done
-    F+="$E[7;1H$E[2K  ${C_MUT}~/git ${C_BRD}·${C_MUT} ${#names[@]} targets ${C_BRD}·${C_MUT} ${DIRTY_REPOS} dirty ${C_BRD}·${C_MUT} v2${RST}"
-    F+="$E[8;1H$E[2K"
+    F+="$E[8;1H$E[2K  ${C_MUT}~/git ${C_BRD}·${C_MUT} ${#names[@]} targets ${C_BRD}·${C_MUT} ${DIRTY_REPOS} dirty ${C_BRD}·${C_MUT} v2${RST}"
+    F+="$E[9;1H$E[2K"
 
     (( SHOW_SYS )) || return
     sw=$(( COLS - SX - 1 ))
     u="${USER:-user}@${HOST}"
     trunc "$u" "$sw"
-    F+="$E[1;${SX}H${C_PNK}${BLD}${USER:-user}${NOB}${C_MUT}@${C_CYN}${BLD}${HOST}${RST}"
-    hr $(( ${#u} < sw ? ${#u} : sw )); F+="$E[2;${SX}H${C_BRD}${_hr}${RST}"
-    ikv os "$C_TXT" "$OS_NAME" "$sw";                      F+="$E[3;${SX}H$_kv"
-    ikv kernel "$C_TXT" "$KERNEL" "$sw";                   F+="$E[4;${SX}H$_kv"
-    ikv claude "$C_TXT" "$CLAUDE_VER" "$sw";               F+="$E[5;${SX}H$_kv"
-    ikv uptime "$C_TXT" "$SYS_UP · load $SYS_LOAD" "$sw";  F+="$E[6;${SX}H$_kv"
+    F+="$E[2;${SX}H${C_PNK}${BLD}${USER:-user}${NOB}${C_MUT}@${C_CYN}${BLD}${HOST}${RST}"
+    hr $(( ${#u} < sw ? ${#u} : sw )); F+="$E[3;${SX}H${C_BRD}${_hr}${RST}"
+    ikv os "$C_TXT" "$OS_NAME" "$sw";                      F+="$E[4;${SX}H$_kv"
+    ikv kernel "$C_TXT" "$KERNEL" "$sw";                   F+="$E[5;${SX}H$_kv"
+    ikv claude "$C_TXT" "$CLAUDE_VER" "$sw";               F+="$E[6;${SX}H$_kv"
+    ikv uptime "$C_TXT" "$SYS_UP · load $SYS_LOAD" "$sw";  F+="$E[7;${SX}H$_kv"
     if (( sw >= 30 )); then
         meter "$SYS_MEM" 12
-        F+="$E[7;${SX}H${C_MUT}mem${RST}      ${_m} ${C_TXT}${SYS_MEM}%${RST}"
+        F+="$E[8;${SX}H${C_MUT}mem${RST}      ${_m} ${C_TXT}${SYS_MEM}%${RST}"
     fi
     # la classica striscia di colori alla neofetch: i colori di /color
     out=""
     for c in "${PALETTE[@]}"; do out+="$E[38;2;${CRGB[$c]}m███"; done
-    (( sw >= 24 )) && F+="$E[8;${SX}H${out}${RST}"
+    (( sw >= 24 )) && F+="$E[9;${SX}H${out}${RST}"
 }
 
 # Una riga della lista, larga esattamente LW-2 colonne → _row
