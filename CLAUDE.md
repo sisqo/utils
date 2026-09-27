@@ -25,7 +25,9 @@ Current scripts:
   the scripts are launched from Hyprland `exec` binds, which don't have
   `~/.local/bin` in `PATH`.
 - `project_color` and its `PALETTE` order must stay identical in `cla` and
-  `cla2`, so a project gets the same `/color` whichever launcher starts it.
+  `cla2`, so a project gets the same default `/color` whichever launcher
+  starts it. A color picked in `cla2` (`o`) is a deliberate `cla2`-only
+  override: `cla` doesn't read `cla2`'s config.
 - Both scripts pass the session name via `-n` (and `--remote-control <name>`),
   because the single initial prompt is already taken by `/color <color>`.
 
@@ -58,9 +60,21 @@ Current scripts:
 - `draw_full` redraws everything after a key press or resize; `draw_tick` only
   redraws the header (animated gradient, system info) and the status bar. The
   main loop's `read -t` timeout (0.1s while animating, 1s otherwise) is the tick.
+- Pins and colors: `~/.config/cla2/projects` (TSV `name<TAB>digit<TAB>color`,
+  keyed by folder name under `~/git`) is loaded into `CFG_PIN`/`CFG_COLOR`,
+  which keep stale entries too. `apply_prefs` derives the per-index
+  `PIN`/`UCOL`/`PCOLOR`, and `save_prefs` rewrites the file atomically on
+  every change. The cwd can be customized only if it sits directly under
+  `~/git` (`customizable`). To test without touching the real file, point
+  `XDG_CONFIG_HOME` at a scratch dir.
+- `VIEW` holds project indices plus, when there's no query, negative
+  separator entries (`SEP_PIN`, `SEP_REST`). `SEL` must never land on one:
+  `move`, `first_sel`, `select_proj` and the mouse handler take care of that.
+  `NPROJ` counts only the projects. `LAUNCH` is a project index, not a `VIEW`
+  position.
 - Git data: `scan_project` collects the cheap per-repo state at startup.
   `inspect` computes the heavy inspector data for the selected project only,
-  and caches it in `CACHE` keyed by `index:width`.
+  and caches it in `CACHE` keyed by index, width, pin and color.
 - The Hyprland binds (`ALT`+`plus` → `cla`, `ALT`+`è`/`egrave` → `cla2`, both
   through `foot`) live in `~/.config/hypr/hyprland.conf`. Changes to binds or
   launch setup are also documented in `~/git/hyprland-ubuntu-parallels`

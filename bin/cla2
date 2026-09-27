@@ -4,7 +4,8 @@
 # mouse e launch sequence. Le funzioni sono quelle di cla: cartella corrente +
 # progetti sotto ~/git, colore /color deterministico (stessa palette, quindi
 # stesso colore di cla), rinomina sessione, toggle remote control / chrome,
-# git pull prima del lancio.
+# git pull prima del lancio. In piu': scorciatoie 1-9 assegnate a mano ("p") e
+# colore scelto per progetto ("o"), salvati in ~/.config/cla2/projects.
 #
 # Niente `set -e`: in una TUI un'espressione aritmetica che vale 0 non deve
 # far morire lo script a meta' disegno.
@@ -22,6 +23,8 @@ GIT_DIR="$HOME/git"
 CURRENT_DIR="$(pwd)"
 # Path assoluto: i bind exec di Hyprland non ereditano ~/.local/bin nel PATH.
 CLAUDE_BIN=/home/user/.local/bin/claude
+# Preferiti e colori scelti: una riga "nome<TAB>cifra<TAB>colore" per progetto.
+PREFS="${XDG_CONFIG_HOME:-$HOME/.config}/cla2/projects"
 
 # ── progetti ──────────────────────────────────────────────────────────────────
 # La prima scelta e' sempre la cartella corrente, poi le cartelle sotto ~/git.
@@ -33,9 +36,14 @@ for full in "$GIT_DIR"/*/; do
     names+=("${full##*/}")
     paths+=("$full")
 done
+# Pin e colore si legano al nome della cartella sotto ~/git: la cwd e'
+# personalizzabile solo se e' uno di quei progetti.
+CWD_IN_GIT=0
+[[ ${CURRENT_DIR%/*} == "$GIT_DIR" ]] && CWD_IN_GIT=1
 
 # Stessa funzione (e stessa palette, nello stesso ordine) di cla: stesso
-# progetto, stesso colore, con qualunque dei due lo si lanci.
+# progetto, stesso colore di default, con qualunque dei due lo si lanci. Un
+# colore scelto con "o" vale solo in cla2.
 PALETTE=(red blue green yellow purple orange pink cyan)
 project_color() {
     local name="$1" sum=0 i c
@@ -143,10 +151,9 @@ meter() {  # $1 percentuale, $2 celle → _m
 }
 
 # ── scansione ─────────────────────────────────────────────────────────────────
-IS_GIT=(); DIRTY=(); BRANCH=(); PCOLOR=()
+IS_GIT=(); DIRTY=(); BRANCH=()
 scan_project() {
     local i=$1 p=${paths[$1]}
-    PCOLOR[i]=$(project_color "${names[i]}")
     if git -C "$p" rev-parse --is-inside-work-tree &>/dev/null; then
         IS_GIT[i]=1
         DIRTY[i]=$(git -C "$p" status --porcelain 2>/dev/null | wc -l)
@@ -154,6 +161,79 @@ scan_project() {
     else
         IS_GIT[i]=0; DIRTY[i]=0; BRANCH[i]=""
     fi
+}
+
+# ── preferenze (pin e colori) ─────────────────────────────────────────────────
+# CFG_* sono indicizzati per nome e tengono anche le voci di cartelle sparite
+# (potrebbero tornare con un re-clone): la loro cifra resta riservata.
+# PIN/UCOL/PCOLOR sono per indice di progetto, ricavati da CFG_* con apply_prefs.
+declare -A CFG_PIN=() CFG_COLOR=()
+PIN=(); UCOL=(); HCOLOR=(); PCOLOR=()
+load_prefs() {
+    local line name d c seen=""
+    [[ -r $PREFS ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line || $line == '#'* ]] && continue
+        # \x1f al posto del TAB: con un separatore "spazio" read fonderebbe i
+        # campi vuoti consecutivi.
+        IFS=$'\x1f' read -r name d c _ <<<"${line//$'\t'/$'\x1f'}"
+        [[ -n $name ]] || continue
+        # voci non valide ignorate; a parita' di cifra vince la prima
+        if [[ $d =~ ^[1-9]$ && $seen != *"$d"* ]]; then seen+=$d; else d=""; fi
+        [[ -n $c && " ${PALETTE[*]} " == *" $c "* ]] || c=""
+        [[ -n $d || -n $c ]] || continue
+        CFG_PIN[$name]=$d; CFG_COLOR[$name]=$c
+    done < "$PREFS"
+}
+# Riscrittura atomica; le righe senza cifra ne' colore spariscono.
+save_prefs() {
+    local k
+    mkdir -p "${PREFS%/*}" 2>/dev/null || { MSG="impossibile creare ${PREFS%/*}"; return 1; }
+    {
+        echo "# cla2: nome<TAB>cifra<TAB>colore (campi vuoti ammessi)"
+        while IFS= read -r k; do
+            [[ -n $k && -n ${CFG_PIN[$k]:-}${CFG_COLOR[$k]:-} ]] || continue
+            printf '%s\t%s\t%s\n' "$k" "${CFG_PIN[$k]:-}" "${CFG_COLOR[$k]:-}"
+        done < <(printf '%s\n' "${!CFG_PIN[@]}" | LC_ALL=C sort)
+    } > "$PREFS.tmp" && mv -f "$PREFS.tmp" "$PREFS" || { MSG="impossibile salvare $PREFS"; return 1; }
+}
+# Prima di ogni modifica si rilegge il file: un altro cla2 aperto potrebbe
+# averlo cambiato nel frattempo, e save_prefs lo riscrive per intero.
+reload_prefs() { CFG_PIN=(); CFG_COLOR=(); load_prefs; }
+customizable() { (( $1 > 0 || CWD_IN_GIT )); }
+apply_prefs() {
+    local i n
+    for i in "${!names[@]}"; do
+        PIN[i]=""; UCOL[i]=""
+        if customizable "$i"; then
+            n=${names[i]}
+            PIN[i]=${CFG_PIN[$n]:-}; UCOL[i]=${CFG_COLOR[$n]:-}
+        fi
+        [[ -n ${HCOLOR[i]:-} ]] || HCOLOR[i]=$(project_color "${names[i]}")
+        PCOLOR[i]=${UCOL[i]:-${HCOLOR[i]}}
+    done
+}
+# $1 indice progetto, $2 cifra ("" = togli il pin). Chi aveva gia' la cifra la perde.
+pin_set() {
+    local n=${names[$1]} k
+    reload_prefs
+    if [[ -n $2 ]]; then
+        for k in "${!CFG_PIN[@]}"; do [[ ${CFG_PIN[$k]} == "$2" ]] && CFG_PIN[$k]=""; done
+    fi
+    CFG_PIN[$n]=$2; CFG_COLOR[$n]=${CFG_COLOR[$n]:-}
+    save_prefs; apply_prefs
+}
+# auto (hash) → red → blue → ... → cyan → auto
+color_cycle() {
+    local n=${names[$1]} c k next
+    reload_prefs
+    c=${CFG_COLOR[$n]:-}; next=${PALETTE[0]}
+    if [[ -n $c ]]; then
+        next=""
+        for k in "${!PALETTE[@]}"; do [[ ${PALETTE[k]} == "$c" ]] && next=${PALETTE[k+1]:-}; done
+    fi
+    CFG_COLOR[$n]=$next; CFG_PIN[$n]=${CFG_PIN[$n]:-}
+    save_prefs; apply_prefs
 }
 
 # Boot log in stile dmesg: i timestamp sono veri, misurati mentre scansiona.
@@ -235,13 +315,16 @@ ikv() {  # $1 etichetta, $2 colore, $3 valore plain, $4 larghezza
 declare -A CACHE=()
 INSP=()
 inspect() {  # $1 indice progetto, $2 larghezza utile → INSP
-    local i=$1 w=$2 key="$1:$2"
+    # pin e colore nella chiave: cambiarli non deve servire una voce vecchia
+    local i=$1 w=$2 key="$1:$2:${PIN[$1]}:${PCOLOR[$1]}:${UCOL[$1]}"
     if [[ -n ${CACHE[$key]+x} ]]; then mapfile -t INSP <<<"${CACHE[$key]}"; return; fi
 
-    local p=${paths[i]} n=${names[i]} color=${PCOLOR[i]} pc L=() line
+    local p=${paths[i]} n=${names[i]} color=${PCOLOR[i]} pc L=() line pin="" auto=""
     pc="$E[38;2;${CRGB[${PCOLOR[i]}]}m"
-    trunc "$n" $(( w - ${#color} - 6 ))
-    L+=("${pc}${BLD}◆ ${_t}${RST}  ${pc}██${RST} ${C_MUT}${color}${RST}")
+    [[ -z ${UCOL[i]} ]] && auto=" (auto)"
+    [[ -n ${PIN[i]} ]] && pin="[${PIN[i]}] "
+    trunc "$n" $(( w - ${#color} - ${#auto} - ${#pin} - 6 ))
+    L+=("${pc}${BLD}◆ ${_t}${RST}  ${C_YLW}${pin}${pc}██${RST} ${C_MUT}${color}${auto}${RST}")
     trunc "${p/#$HOME/\~}" "$w"; L+=("${C_MUT}${_t}${RST}")
     L+=("")
 
@@ -423,18 +506,44 @@ fuzzy() {
     done
     (( j == ${#q} ))
 }
-refilter() {
-    local i front=() back=()
+# Ordine base: cwd (se non e' tra i preferiti), preferiti per cifra, poi il
+# resto in ordine alfabetico. Senza query VIEW contiene anche i separatori
+# (SEP_PIN, SEP_REST: indici negativi, mai selezionabili); con la query e'
+# una lista piatta. NPROJ conta solo i progetti.
+SEP_PIN=-1; SEP_REST=-2
+ALPHA=()
+sort_alpha() {
+    mapfile -t ALPHA < <(for i in "${!names[@]}"; do printf '%s\t%s\n' "${names[i]}" "$i"; done |
+        LC_ALL=C sort -f -t $'\t' -k1,1 | cut -f2)
+}
+first_sel() { SEL=0; (( ${#VIEW[@]} && VIEW[0] < 0 )) && SEL=1; }
+refilter() {  # $1 progetto da tenere selezionato (opzionale)
+    local want=${1:--1} i d v top=() pins=() rest=() front=() back=()
     MATCH=()
-    for i in "${!names[@]}"; do
-        if [[ -z $QUERY ]]; then front+=("$i"); continue; fi
-        fuzzy "$QUERY" "${names[i]}" || continue
-        MATCH[$i]=$_m
-        # chi inizia con la query sale in cima, il resto mantiene l'ordine
-        if [[ ${names[i],,} == "${QUERY,,}"* ]]; then front+=("$i"); else back+=("$i"); fi
+    [[ -z ${PIN[0]} ]] && top=(0)
+    for d in 1 2 3 4 5 6 7 8 9; do
+        for i in "${ALPHA[@]}"; do [[ ${PIN[i]} == "$d" ]] && pins+=("$i"); done
     done
-    VIEW=("${front[@]}" "${back[@]}")
-    SEL=0; OFFSET=0
+    for i in "${ALPHA[@]}"; do (( i > 0 )) && [[ -z ${PIN[i]} ]] && rest+=("$i"); done
+    if [[ -z $QUERY ]]; then
+        VIEW=("${top[@]}")
+        (( ${#pins[@]} )) && VIEW+=("$SEP_PIN" "${pins[@]}")
+        (( ${#rest[@]} )) && VIEW+=("$SEP_REST" "${rest[@]}")
+        NPROJ=$(( ${#top[@]} + ${#pins[@]} + ${#rest[@]} ))
+        (( want < 0 )) && want=0
+    else
+        for i in "${top[@]}" "${pins[@]}" "${rest[@]}"; do
+            fuzzy "$QUERY" "${names[i]}" || continue
+            MATCH[$i]=$_m
+            # chi inizia con la query sale in cima, il resto mantiene l'ordine
+            if [[ ${names[i],,} == "${QUERY,,}"* ]]; then front+=("$i"); else back+=("$i"); fi
+        done
+        VIEW=("${front[@]}" "${back[@]}")
+        NPROJ=${#VIEW[@]}
+    fi
+    OFFSET=0; SEL=-1
+    for v in "${!VIEW[@]}"; do (( VIEW[v] == want )) && SEL=$v; done
+    (( SEL < 0 )) && first_sel
 }
 
 # ── layout ────────────────────────────────────────────────────────────────────
@@ -507,16 +616,27 @@ draw_header() {
 
 # Una riga della lista, larga esattamente LW-2 colonne → _row
 list_row() {
-    local vi=$1 i=${VIEW[$1]} iw=$(( LW - 2 )) nw sel=0 out num numc icon iconc nm m k ch namec st stc rest
+    local vi=$1 i=${VIEW[$1]} iw=$(( LW - 2 )) nw sel=0 out num numc icon iconc nm m k ch namec st stc rest label
+    if (( i < 0 )); then
+        if (( i == SEP_PIN )); then label="preferiti"; else label="altri"; fi
+        hr $(( iw - 6 - ${#label} ))
+        _row=" ${C_BRD}── ${C_MUT}${label} ${C_BRD}${_hr}${RST} "
+        return
+    fi
     (( vi == SEL )) && sel=1
     nw=$(( iw - 12 ))
     trunc "${names[i]}" "$nw"; nm=$_t
 
-    printf -v num '%2d' $(( vi + 1 ))
-    if (( vi < 9 )); then numc=$C_YLW; else numc=$C_BRD; fi
-    if (( i == 0 )); then icon=$G_CWD; iconc=$C_YLW
-    elif (( IS_GIT[i] )); then icon=$G_GIT; iconc="$E[38;2;${CRGB[${PCOLOR[i]}]}m"
-    else icon=$G_DIR; iconc=$C_MUT; fi
+    printf -v num '%2s' "${PIN[i]}"
+    numc=$C_YLW
+    # il colore scelto a mano si vede sull'icona anche per cwd e cartelle non git
+    if [[ -n ${UCOL[i]} ]]; then iconc="$E[38;2;${CRGB[${UCOL[i]}]}m"
+    elif (( i == 0 )); then iconc=$C_YLW
+    elif (( IS_GIT[i] )); then iconc="$E[38;2;${CRGB[${PCOLOR[i]}]}m"
+    else iconc=$C_MUT; fi
+    if (( i == 0 )); then icon=$G_CWD
+    elif (( IS_GIT[i] )); then icon=$G_GIT
+    else icon=$G_DIR; fi
 
     out=""
     (( sel )) && out+="$E[48;2;${R_SEL}m${C_PNK}▌" || out+=" "
@@ -549,10 +669,14 @@ draw_panels() {
     # tieni la selezione nel viewport
     (( SEL < OFFSET )) && OFFSET=$SEL
     (( SEL >= OFFSET + LIST_H )) && OFFSET=$(( SEL - LIST_H + 1 ))
+    # se la riga appena sopra e' un separatore, mostralo finche' SEL resta visibile
+    (( OFFSET > 0 && VIEW[OFFSET - 1] < 0 && SEL - OFFSET + 1 < LIST_H )) && OFFSET=$(( OFFSET - 1 ))
 
     # ── bordo superiore sinistro
     if [[ $MODE == search ]]; then title=" /${QUERY}▏ "; else title=" PROJECTS "; fi
-    tag=" $(( n ? SEL + 1 : 0 ))/${n} "
+    local pos=0
+    for (( r=0; r<=SEL && r<n; r++ )); do (( VIEW[r] >= 0 )) && pos=$(( pos + 1 )); done
+    tag=" ${pos}/${NPROJ} "
     fill=$(( LW - 3 - ${#title} - ${#tag} - 1 ))
     if (( fill < 0 )); then tag=""; fill=$(( LW - 4 - ${#title} )); fi
     hr "$fill"
@@ -610,15 +734,25 @@ pl_seg() {  # $1 testo, $2 bg "r;g;b", $3 fg "r;g;b"
     if [[ -n $PL_BG ]]; then PL+="$E[38;2;${PL_BG}m$E[48;2;$2m${G_SEP_R}"; PL_LEN=$(( PL_LEN + 1 )); fi
     PL+="$E[48;2;$2m$E[38;2;$3m$1"; PL_LEN=$(( PL_LEN + ${#1} )); PL_BG=$2
 }
-HINTS=""; HLEN=0
-hint() { HINTS+="${C_TXT}${BLD}$1${NOB}${C_MUT} $2  "; HLEN=$(( HLEN + ${#1} + ${#2} + 3 )); }
+# I suggerimenti entrano in ordine di priorita' finche' c'e' spazio (HMAX).
+HINTS=""; HLEN=0; HMAX=0; HFULL=0
+hint() {
+    local len=$(( ${#1} + ${#2} + 3 ))
+    (( HFULL || HLEN + len > HMAX )) && { HFULL=1; return; }
+    HINTS+="${C_TXT}${BLD}$1${NOB}${C_MUT} $2  "; HLEN=$(( HLEN + len ))
+}
+# Messaggio di una sola schermata nella status bar (sparisce al tasto dopo).
+MSG=""
+# "pin" mentre si aspetta la cifra dopo "p".
+PENDING=""
 
 draw_status() {
     local clock fill
     PL=""; PL_LEN=0; PL_BG=""
-    if [[ $MODE == search ]]; then pl_seg " ${G_SEARCH} SEARCH " "$R_CYN" "$R_DRK"
+    if [[ $PENDING == pin ]]; then pl_seg " PIN ▸ " "$R_YLW" "$R_DRK"
+    elif [[ $MODE == search ]]; then pl_seg " ${G_SEARCH} SEARCH " "$R_CYN" "$R_DRK"
     else pl_seg " ${G_TERM} NORMAL " "$R_PNK" "$R_DRK"; fi
-    pl_seg " ${#VIEW[@]}/${#names[@]} " "$R_SEG" "$R_TXT"
+    pl_seg " ${NPROJ}/${#names[@]} " "$R_SEG" "$R_TXT"
     if [[ $REMOTE_CONTROL == true ]]; then pl_seg " ${G_WIFI} RC ON " "$R_GRN" "$R_DRK"
     else pl_seg " ${G_WIFI} RC OFF " "$R_SEG" "$R_MUT"; fi
     if [[ $CHROME == true ]]; then pl_seg " ${G_CHROME} CHROME ON " "$R_GRN" "$R_DRK"
@@ -626,12 +760,17 @@ draw_status() {
     PL+="$E[38;2;${PL_BG}m$E[48;2;${R_BAR}m${G_SEP_R}"; PL_LEN=$(( PL_LEN + 1 ))
 
     printf -v clock ' %(%H:%M:%S)T ' -1
-    HINTS=""; HLEN=0
-    if [[ $MODE == search ]]; then
+    HINTS=""; HLEN=0; HFULL=0; HMAX=$(( COLS - PL_LEN - ${#clock} - 2 ))
+    if [[ -n $MSG ]]; then
+        trunc "$MSG  " "$HMAX"; HINTS="${C_YLW}${_t}"; HLEN=${#_t}
+    elif [[ $PENDING == pin ]]; then
+        hint "1-9" "assegna"; hint "0/p" "rimuovi"; hint "esc" "annulla"
+    elif [[ $MODE == search ]]; then
         hint "type" "filtra"; hint "↑↓" "muovi"; hint "⏎" "lancia"; hint "esc" "annulla"
     else
         hint "↑↓/jk" "muovi"; hint "⏎" "lancia"; hint "1-9" "rapido"; hint "/" "cerca"
-        hint "r" "remote"; hint "c" "chrome"; hint "a" "anim"; hint "q" "esci"
+        hint "p" "pin"; hint "o" "colore"; hint "r" "remote"; hint "c" "chrome"
+        hint "a" "anim"; hint "q" "esci"
     fi
     fill=$(( COLS - PL_LEN - HLEN - ${#clock} - 1 ))
     if (( fill < 1 )); then HINTS=""; HLEN=0; fill=$(( COLS - PL_LEN - ${#clock} - 1 )); fi
@@ -680,11 +819,11 @@ step() {  # $1 esito (ok|warn|off), $2 etichetta, $3 dettaglio
 # readline conta anche i codici colore nel prompt se non sono racchiusi in \001..\002
 rl() { printf '\001%s\002' "$1"; }
 
-launch_claude() {
-    local path="$1" name="$2" color pc rename_text claude_args=() tmp pid st last k cols
+launch_claude() {  # $1 path, $2 nome, $3 colore /color
+    local path="$1" name="$2" color="$3" pc rename_text claude_args=() tmp pid st last k cols
     local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
-    # Il colore resta legato al nome della cartella, non al nome della sessione.
-    color="$(project_color "$name")"
+    # Il colore resta legato alla cartella (scelto o hash del nome), non al
+    # nome della sessione.
     pc="$E[38;2;${CRGB[$color]}m"
     cols=$(tput cols 2>/dev/null || echo 80)
 
@@ -758,15 +897,26 @@ launch_claude() {
     exec "$CLAUDE_BIN" "${claude_args[@]}" -n "$rename_text" "/color $color"
 }
 
+load_prefs
+apply_prefs
+sort_alpha
+refilter
+
 # ── fallback senza terminale interattivo (piped/redirect) ─────────────────────
+# Stesso ordine della TUI, senza separatori.
 if [ ! -t 0 ]; then
+    order=(); labels=()
+    for i in "${VIEW[@]}"; do
+        (( i < 0 )) && continue
+        order+=("$i"); labels+=("${PIN[i]:+[${PIN[i]}] }${names[i]}")
+    done
     PS3="Scegli un progetto: "
-    select name in "${names[@]}"; do
+    select name in "${labels[@]}"; do
         [ -n "${name:-}" ] && break
         echo "Scelta non valida."
     done
-    idx=$((REPLY - 1))
-    launch_claude "${paths[$idx]}" "${names[$idx]}"
+    idx=${order[REPLY - 1]}
+    launch_claude "${paths[$idx]}" "${names[$idx]}" "${PCOLOR[$idx]}"
 fi
 
 # ── main loop ─────────────────────────────────────────────────────────────────
@@ -779,15 +929,21 @@ tui_on
 layout
 boot
 mouse_on
-refilter
 printf '\033[H\033[2J'
 draw_full
 
+# LAUNCH e' l'indice del progetto da lanciare (-1 = nessuno).
 LAUNCH=-1
-move() {  # $1 delta
-    local n=${#VIEW[@]}
+move() {  # $1 delta; i separatori si saltano nella direzione del movimento
+    local n=${#VIEW[@]} d=1
     (( n == 0 )) && return
+    (( $1 < 0 )) && d=-1
     SEL=$(( (SEL + $1 + n * 100) % n ))
+    (( VIEW[SEL] < 0 )) && SEL=$(( (SEL + d + n) % n ))
+}
+select_proj() {  # $1 indice progetto
+    local v
+    for v in "${!VIEW[@]}"; do (( VIEW[v] == $1 )) && SEL=$v; done
 }
 
 # Mouse SGR (ESC [ < b ; x ; y M): click seleziona, secondo click sulla stessa
@@ -806,8 +962,8 @@ handle_mouse() {
         0)
             if (( x <= LW && y > TOP && y < TOP + PH - 1 )); then
                 vi=$(( OFFSET + y - TOP - 1 ))
-                if (( vi < ${#VIEW[@]} )); then
-                    if (( vi == SEL )); then LAUNCH=$vi; else SEL=$vi; fi
+                if (( vi < ${#VIEW[@]} && VIEW[vi] >= 0 )); then
+                    if (( vi == SEL )); then LAUNCH=${VIEW[vi]}; else SEL=$vi; fi
                 fi
             fi
             ;;
@@ -815,7 +971,18 @@ handle_mouse() {
 }
 
 handle_key() {
-    local key=$1 k2 k3 k4
+    local key=$1 k2 k3 k4 i
+    MSG=""
+    # dopo "p": 1-9 assegna, 0/p toglie, qualunque altro tasto annulla
+    if [[ $PENDING == pin ]]; then
+        PENDING=""
+        case $key in
+            [1-9]) pin_set "${VIEW[SEL]}" "$key"; refilter "${VIEW[SEL]}" ;;
+            0|p|P) pin_set "${VIEW[SEL]}" ""; refilter "${VIEW[SEL]}" ;;
+            $'\x1b') while IFS= read -rsn1 -t 0.02 k2; do :; done ;;  # resto di frecce/mouse
+        esac
+        return
+    fi
     if [[ $key == $'\x1b' ]]; then
         if ! IFS= read -rsn1 -t 0.02 k2; then
             # Esc da solo: esce dalla ricerca, o dal programma
@@ -827,7 +994,7 @@ handle_key() {
             case $k3 in
                 A) move -1 ;;
                 B) move 1 ;;
-                H) SEL=0 ;;
+                H) first_sel ;;
                 F) SEL=$(( ${#VIEW[@]} ? ${#VIEW[@]} - 1 : 0 )) ;;
                 5) IFS= read -rsn1 -t 0.02 k4; move $(( -LIST_H )) ;;
                 6) IFS= read -rsn1 -t 0.02 k4; move "$LIST_H" ;;
@@ -837,7 +1004,7 @@ handle_key() {
         return
     fi
     if [[ -z $key ]]; then
-        (( ${#VIEW[@]} > 0 )) && LAUNCH=$SEL
+        (( ${#VIEW[@]} > 0 )) && LAUNCH=${VIEW[SEL]}
         return
     fi
 
@@ -855,14 +1022,23 @@ handle_key() {
     case $key in
         j) move 1 ;;
         k) move -1 ;;
-        g) SEL=0 ;;
+        g) first_sel ;;
         G) SEL=$(( ${#VIEW[@]} ? ${#VIEW[@]} - 1 : 0 )) ;;
         /) MODE=search ;;
         r|R) [[ $REMOTE_CONTROL == true ]] && REMOTE_CONTROL=false || REMOTE_CONTROL=true ;;
         c|C) [[ $CHROME == true ]] && CHROME=false || CHROME=true ;;
         a|A) [[ $ANIM == true ]] && ANIM=false || ANIM=true ;;
+        p|P)
+            if customizable "${VIEW[SEL]}"; then PENDING=pin
+            else MSG="la cwd non e' un progetto di ~/git: niente pin"; fi ;;
+        o|O)
+            if customizable "${VIEW[SEL]}"; then color_cycle "${VIEW[SEL]}"
+            else MSG="la cwd non e' un progetto di ~/git: niente colore"; fi ;;
         q|Q) exit 0 ;;
-        [1-9]) (( key - 1 < ${#VIEW[@]} )) && { SEL=$(( key - 1 )); LAUNCH=$SEL; } ;;
+        [1-9])
+            for i in "${!names[@]}"; do
+                [[ ${PIN[i]} == "$key" ]] && { select_proj "$i"; LAUNCH=$i; }
+            done ;;
     esac
 }
 
@@ -873,9 +1049,9 @@ while true; do
         handle_key "$key"
         if (( LAUNCH >= 0 )); then
             draw_full
-            idx=${VIEW[LAUNCH]}
+            idx=$LAUNCH
             tui_off
-            launch_claude "${paths[$idx]}" "${names[$idx]}"
+            launch_claude "${paths[$idx]}" "${names[$idx]}" "${PCOLOR[$idx]}"
         fi
         draw_full
     else
