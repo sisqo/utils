@@ -1,0 +1,891 @@
+#!/usr/bin/env bash
+# cla2 — cla in versione cockpit: TUI a tutto schermo con boot log, banner a
+# gradiente animato, inspector git del progetto selezionato, ricerca fuzzy,
+# mouse e launch sequence. Le funzioni sono quelle di cla: cartella corrente +
+# progetti sotto ~/git, colore /color deterministico (stessa palette, quindi
+# stesso colore di cla), rinomina sessione, toggle remote control / chrome,
+# git pull prima del lancio.
+#
+# Niente `set -e`: in una TUI un'espressione aritmetica che vale 0 non deve
+# far morire lo script a meta' disegno.
+set -uo pipefail
+shopt -s nullglob
+
+# Stato iniziale dei toggle: si cambiano con "r" e "c" prima di confermare.
+REMOTE_CONTROL=true
+CHROME=true
+# Gradiente del banner animato; "a" lo ferma, CLA2_STATIC=1 lo parte fermo.
+ANIM=true
+[[ -n ${CLA2_STATIC:-} ]] && ANIM=false
+
+GIT_DIR="$HOME/git"
+CURRENT_DIR="$(pwd)"
+# Path assoluto: i bind exec di Hyprland non ereditano ~/.local/bin nel PATH.
+CLAUDE_BIN=/home/user/.local/bin/claude
+
+# ── progetti ──────────────────────────────────────────────────────────────────
+# La prima scelta e' sempre la cartella corrente, poi le cartelle sotto ~/git.
+names=("$(basename "$CURRENT_DIR")")
+paths=("$CURRENT_DIR")
+for full in "$GIT_DIR"/*/; do
+    full="${full%/}"
+    [[ "$full" == "$CURRENT_DIR" ]] && continue
+    names+=("${full##*/}")
+    paths+=("$full")
+done
+
+# Stessa funzione (e stessa palette, nello stesso ordine) di cla: stesso
+# progetto, stesso colore, con qualunque dei due lo si lanci.
+PALETTE=(red blue green yellow purple orange pink cyan)
+project_color() {
+    local name="$1" sum=0 i c
+    for (( i=0; i<${#name}; i++ )); do
+        c="${name:i:1}"
+        sum=$(( sum + $(printf '%d' "'$c") ))
+    done
+    echo "${PALETTE[$(( sum % ${#PALETTE[@]} ))]}"
+}
+
+# ── colori (truecolor) ────────────────────────────────────────────────────────
+E=$'\033'
+RST="$E[0m"; BLD="$E[1m"; NOB="$E[22m"
+R_TXT="205;214;244"; R_WHT="255;255;255"; R_MUT="108;112;134"; R_BRD="69;71;90"
+R_CYN="0;229;255";   R_PNK="255;46;151";  R_PUR="176;75;255";  R_GRN="57;255;130"
+R_YLW="255;214;10";  R_RED="255;85;85";   R_DRK="17;17;27";    R_SEL="40;42;66"
+R_BAR="22;22;34";    R_SEG="49;50;68"
+for c in TXT WHT MUT BRD CYN PNK PUR GRN YLW RED; do
+    v="R_$c"; printf -v "C_$c" '\033[38;2;%sm' "${!v}"
+done
+
+# Glifi Nerd Font (il terminale usa JetBrainsMono Nerd Font Mono: 1 cella l'uno).
+G_BRANCH=$'\ue0a0'; G_SEP_R=$'\ue0b0'; G_SEP_L=$'\ue0b2'
+G_GIT=$'\ue725';    G_DIR=$'\uf07b';   G_CWD=$'\uf124'
+G_TERM=$'\uf120';   G_SEARCH=$'\uf002'; G_WIFI=$'\uf1eb'; G_CHROME=$'\uf268'
+
+# RGB dei colori accettati da /color, per mostrare il colore della sessione.
+declare -A CRGB=(
+    [red]="255;85;85" [blue]="80;140;255" [green]="57;255;130" [yellow]="255;214;10"
+    [purple]="176;75;255" [orange]="255;150;50" [pink]="255;110;199" [cyan]="0;229;255"
+)
+
+# Gradiente ciclico ciano → viola → rosa → ciano, 48 passi. GRAD_DIM e' la
+# stessa rampa a luminosita' ridotta, per l'"ombra" del banner.
+GRAD=(); GRAD_DIM=()
+stops=("0 229 255" "176 75 255" "255 46 151" "0 229 255")
+for (( s=0; s<3; s++ )); do
+    read -r r1 g1 b1 <<<"${stops[s]}"
+    read -r r2 g2 b2 <<<"${stops[s+1]}"
+    for (( t=0; t<16; t++ )); do
+        r=$(( r1 + (r2-r1)*t/16 )); g=$(( g1 + (g2-g1)*t/16 )); b=$(( b1 + (b2-b1)*t/16 ))
+        printf -v esc '\033[38;2;%d;%d;%dm' "$r" "$g" "$b"; GRAD+=("$esc")
+        printf -v esc '\033[38;2;%d;%d;%dm' $((r*45/100)) $((g*45/100)) $((b*45/100)); GRAD_DIM+=("$esc")
+    done
+done
+
+BANNER=(
+    " ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗"
+    "██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝"
+    "██║     ██║     ███████║██║   ██║██║  ██║█████╗  "
+    "██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  "
+    "╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗"
+    " ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝"
+)
+BANNER_W=${#BANNER[0]}
+
+# ── helper di testo ───────────────────────────────────────────────────────────
+# Tutto cio' che finisce in un riquadro viene troncato *prima* di colorarlo:
+# cosi' la larghezza visibile e' sempre nota e nessuna riga sfora il bordo.
+trunc() {  # $1 testo, $2 larghezza → _t
+    local s=$1 w=$2
+    if (( w <= 0 )); then _t=""
+    elif (( ${#s} > w )); then _t="${s:0:w-1}…"
+    else _t=$s; fi
+}
+spaces() { printf -v _s '%*s' "$(( $1 > 0 ? $1 : 0 ))" ''; }
+hr()     { spaces "$1"; _hr=${_s// /─}; }
+lpad()   { spaces $(( $2 - ${#1} )); _l="$_s$1"; }
+
+# ── info di sistema ───────────────────────────────────────────────────────────
+OS_NAME=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}")
+KERNEL=$(uname -r)
+HOST=$(hostname -s 2>/dev/null || uname -n)
+CLAUDE_VER=$("$CLAUDE_BIN" --version 2>/dev/null | awk '{print $1}')
+CLAUDE_VER=${CLAUDE_VER:-?}
+
+sys_dynamic() {
+    local up _ k v tot=1 avail=0 d
+    read -r up _ < /proc/uptime; up=${up%.*}
+    d=$(( up / 86400 ))
+    if (( d > 0 )); then SYS_UP="${d}d $(( up % 86400 / 3600 ))h"
+    else SYS_UP="$(( up / 3600 ))h $(( up % 3600 / 60 ))m"; fi
+    read -r SYS_LOAD _ < /proc/loadavg
+    while read -r k v _; do
+        case $k in MemTotal:) tot=$v ;; MemAvailable:) avail=$v; break ;; esac
+    done < /proc/meminfo
+    SYS_MEM=$(( (tot - avail) * 100 / tot ))
+    SYS_MEM_TXT="$(( (tot - avail) / 1048576 )).$(( (tot - avail) % 1048576 * 10 / 1048576 ))/$(( tot / 1048576 ))G"
+}
+
+# Barra ▰▱ colorata verde → giallo → rosso in base alla percentuale.
+meter() {  # $1 percentuale, $2 celle → _m
+    local pct=$1 n=$2 on k col
+    on=$(( (pct * n + 50) / 100 ))
+    _m=""
+    for (( k=0; k<n; k++ )); do
+        if (( k < on )); then
+            if (( k < n/2 )); then col=$C_GRN; elif (( k < n*8/10 )); then col=$C_YLW; else col=$C_RED; fi
+            _m+="${col}▰"
+        else
+            _m+="${C_BRD}▱"
+        fi
+    done
+    _m+=$RST
+}
+
+# ── scansione ─────────────────────────────────────────────────────────────────
+IS_GIT=(); DIRTY=(); BRANCH=(); PCOLOR=()
+scan_project() {
+    local i=$1 p=${paths[$1]}
+    PCOLOR[i]=$(project_color "${names[i]}")
+    if git -C "$p" rev-parse --is-inside-work-tree &>/dev/null; then
+        IS_GIT[i]=1
+        DIRTY[i]=$(git -C "$p" status --porcelain 2>/dev/null | wc -l)
+        BRANCH[i]=$(git -C "$p" symbolic-ref --short -q HEAD 2>/dev/null || git -C "$p" rev-parse --short HEAD 2>/dev/null || echo "?")
+    else
+        IS_GIT[i]=0; DIRTY[i]=0; BRANCH[i]=""
+    fi
+}
+
+# Boot log in stile dmesg: i timestamp sono veri, misurati mentre scansiona.
+boot() {
+    local t0 i n st dirty_total=0 fast=${CLA2_NOBOOT:-}
+    t0=${EPOCHREALTIME//[.,]/}
+    blog() {
+        local e=$(( ${EPOCHREALTIME//[.,]/} - t0 ))
+        printf '%s[%5d.%06d]%s %s\n' "$C_MUT" $(( e / 1000000 )) $(( e % 1000000 )) "$RST" "$1"
+        [[ -z $fast ]] && sleep 0.012
+    }
+    printf '\033[H\033[2J\n'
+    blog "${C_PUR}${BLD}cla2${RST}: neural link online ${C_MUT}· bash ${BASH_VERSION%%(*} · ${TERM:-?} · ${COLS}x${ROWS} · truecolor${RST}"
+    blog "${C_PUR}cla2${RST}: claude ${C_CYN}${CLAUDE_VER}${RST} at ${C_MUT}${CLAUDE_BIN/#$HOME/\~}${RST}"
+    blog "${C_PUR}scan${RST}: ${C_CYN}~/git${RST} → ${#names[@]} targets"
+    for i in "${!names[@]}"; do
+        scan_project "$i"
+        trunc "${names[i]}" 22; spaces $(( 22 - ${#_t} )); n="$_t$_s"
+        if (( ! IS_GIT[i] )); then
+            st="${C_MUT}[ -- ]${RST} ${n} ${C_MUT}no git${RST}"
+        elif (( DIRTY[i] > 0 )); then
+            st="${C_YLW}[DIRT]${RST} ${n} ${C_CYN}${BRANCH[i]}${RST} ${C_YLW}✚${DIRTY[i]}${RST}"
+            dirty_total=$(( dirty_total + 1 ))
+        else
+            st="${C_GRN}[ OK ]${RST} ${n} ${C_CYN}${BRANCH[i]}${RST} ${C_GRN}clean${RST}"
+        fi
+        blog "$st"
+    done
+    DIRTY_REPOS=$dirty_total
+    sys_dynamic
+    blog "${C_PUR}mem${RST}: ${SYS_MEM_TXT} · ${C_PUR}load${RST}: ${SYS_LOAD} · ${C_PUR}up${RST}: ${SYS_UP}"
+    blog "${C_GRN}${BLD}ready${RST}. entering cockpit${C_PNK}▌${RST}"
+    [[ -z $fast ]] && sleep 0.25
+}
+
+# ── inspector ─────────────────────────────────────────────────────────────────
+# Linguaggio (e colore alla GitHub) da estensione del file.
+lang_of() {
+    case $1 in
+        sh|bash|zsh|fish) _lang=shell ;;  js|mjs|cjs|jsx) _lang=js ;;
+        ts|tsx|mts)       _lang=ts ;;     py)             _lang=python ;;
+        html|htm)         _lang=html ;;   css|scss|sass)  _lang=css ;;
+        md|mdx)           _lang=md ;;     json|jsonc)     _lang=json ;;
+        go)               _lang=go ;;     rs)             _lang=rust ;;
+        rb)               _lang=ruby ;;   php)            _lang=php ;;
+        lua)              _lang=lua ;;    vue)            _lang=vue ;;
+        svelte)           _lang=svelte ;; c|h|cpp|hpp|cc) _lang=c ;;
+        yml|yaml|toml|ini|conf|cfg) _lang=config ;;
+        svg|png|jpg|jpeg|gif|ico|webp|mp3|wav|ogg|woff|woff2|ttf) _lang=assets ;;
+        *)                _lang=other ;;
+    esac
+}
+declare -A LANG_RGB=(
+    [shell]="137;224;81" [js]="241;224;90" [ts]="49;120;198" [python]="53;114;165"
+    [html]="227;76;38" [css]="163;113;247" [md]="120;150;200" [json]="203;203;65"
+    [go]="0;173;216" [rust]="222;165;132" [ruby]="204;52;45" [php]="119;123;179"
+    [lua]="80;80;220" [vue]="65;184;131" [svelte]="255;62;0" [c]="160;160;160"
+    [config]="200;120;80" [assets]="180;180;180" [other]="108;112;134"
+)
+
+# "2 weeks ago" → "2w", "3 months ago" → "3mo", "1 year, 2 months ago" → "1y"
+short_rel() {
+    local n u _
+    read -r n u _ <<<"$1"
+    case $u in
+        second*) u=s ;; minute*) u=m ;; hour*) u=h ;; day*) u=d ;;
+        week*) u=w ;; month*) u=mo ;; year*) u=y ;; *) u="" ;;
+    esac
+    _ago="${n}${u}"
+}
+
+# Riga "etichetta  valore" dell'inspector, col valore gia' troncato.
+ikv() {  # $1 etichetta, $2 colore, $3 valore plain, $4 larghezza
+    trunc "$3" $(( $4 - 9 ))
+    spaces $(( 8 - ${#1} ))
+    _kv="${C_MUT}$1${_s}${RST} $2${_t}${RST}"
+}
+
+declare -A CACHE=()
+INSP=()
+inspect() {  # $1 indice progetto, $2 larghezza utile → INSP
+    local i=$1 w=$2 key="$1:$2"
+    if [[ -n ${CACHE[$key]+x} ]]; then mapfile -t INSP <<<"${CACHE[$key]}"; return; fi
+
+    local p=${paths[i]} n=${names[i]} color=${PCOLOR[i]} pc L=() line
+    pc="$E[38;2;${CRGB[${PCOLOR[i]}]}m"
+    trunc "$n" $(( w - ${#color} - 6 ))
+    L+=("${pc}${BLD}◆ ${_t}${RST}  ${pc}██${RST} ${C_MUT}${color}${RST}")
+    trunc "${p/#$HOME/\~}" "$w"; L+=("${C_MUT}${_t}${RST}")
+    L+=("")
+
+    if (( IS_GIT[i] )); then
+        local g=(git -C "$p") ab ahead=0 behind=0 upstream
+        upstream=$("${g[@]}" rev-parse --abbrev-ref '@{u}' 2>/dev/null)
+        if [[ -n $upstream ]]; then
+            ab=$("${g[@]}" rev-list --left-right --count 'HEAD...@{u}' 2>/dev/null)
+            read -r ahead behind <<<"${ab:-0 0}"
+        fi
+        # branch + upstream + ahead/behind (rispetto all'ultimo fetch)
+        local sync="" sync_len=0
+        if [[ -z $upstream ]]; then sync=" ${C_MUT}no upstream"; sync_len=12
+        elif (( ahead == 0 && behind == 0 )); then sync=" ${C_MUT}≡ ${upstream}"; sync_len=$(( 3 + ${#upstream} ))
+        else
+            (( ahead > 0 ))  && { sync+=" ${C_GRN}↑${ahead}";  sync_len=$(( sync_len + 2 + ${#ahead} )); }
+            (( behind > 0 )) && { sync+=" ${C_RED}↓${behind}"; sync_len=$(( sync_len + 2 + ${#behind} )); }
+        fi
+        trunc "${BRANCH[i]}" $(( w - 11 - sync_len ))
+        if (( w - 11 - sync_len < 4 )); then sync=""; trunc "${BRANCH[i]}" $(( w - 11 )); fi
+        L+=("${C_MUT}branch${RST}   ${C_CYN}${BLD}${G_BRANCH} ${_t}${RST}${sync}${RST}")
+
+        # stato working tree
+        local staged=0 modified=0 untracked=0 x y
+        while IFS= read -r line; do
+            x=${line:0:1}; y=${line:1:1}
+            if [[ $x$y == '??' ]]; then untracked=$(( untracked + 1 )); continue; fi
+            [[ $x != ' ' ]] && staged=$(( staged + 1 ))
+            [[ $y != ' ' ]] && modified=$(( modified + 1 ))
+        done < <("${g[@]}" status --porcelain 2>/dev/null)
+        if (( staged + modified + untracked == 0 )); then
+            L+=("${C_MUT}state${RST}    ${C_GRN}✔ clean${RST}")
+        else
+            local long="" short="" plain=""
+            (( staged ))    && { long+="${C_GRN}✚${staged}${C_MUT} staged  ";      short+="${C_GRN}✚${staged} ";    plain+="✚${staged} staged  "; }
+            (( modified ))  && { long+="${C_YLW}●${modified}${C_MUT} modified  ";  short+="${C_YLW}●${modified} ";  plain+="●${modified} modified  "; }
+            (( untracked )) && { long+="${C_RED}?${untracked}${C_MUT} untracked"; short+="${C_RED}?${untracked}"; plain+="?${untracked} untracked"; }
+            if (( ${#plain} <= w - 9 )); then L+=("${C_MUT}state${RST}    ${long}${RST}")
+            else L+=("${C_MUT}state${RST}    ${short}${RST}"); fi
+        fi
+
+        # ultimo commit
+        local sha="" subj="" rel="" author=""
+        IFS=$'\x1f' read -r sha subj rel author < <("${g[@]}" log -1 --format='%h%x1f%s%x1f%cr%x1f%an' 2>/dev/null)
+        if [[ -n $sha ]]; then
+            trunc "$subj" $(( w - 10 - ${#sha} ))
+            L+=("${C_MUT}head${RST}     ${C_YLW}${sha}${RST} ${C_TXT}${_t}${RST}")
+            trunc "$rel · $author" $(( w - 9 ))
+            L+=("         ${C_MUT}${_t}${RST}")
+        else
+            L+=("${C_MUT}head${RST}     ${C_MUT}∅ nessun commit${RST}")
+        fi
+
+        local remote total stashes
+        remote=$("${g[@]}" remote get-url origin 2>/dev/null)
+        remote=${remote%.git}; remote=${remote#*://}; remote=${remote#git@}; remote=${remote/://}
+        ikv remote "$C_PUR" "${remote:-—}" "$w"; L+=("$_kv")
+        total=$("${g[@]}" rev-list --count HEAD 2>/dev/null)
+        stashes=$("${g[@]}" stash list 2>/dev/null | wc -l)
+        line="${total:-0}"
+        (( stashes > 0 )) && line+=" · ${stashes} stash"
+        ikv commits "$C_TXT" "$line" "$w"; L+=("$_kv")
+        L+=("")
+
+        # attivita': commit per settimana nelle ultime 16, come sparkline
+        local now=$EPOCHSECONDS t k max=0 sum=0 lvl spark="" bk=()
+        local ticks=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █)
+        for (( k=0; k<16; k++ )); do bk[k]=0; done
+        while read -r t; do
+            k=$(( 15 - (now - t) / 604800 ))
+            (( k >= 0 && k < 16 )) && bk[k]=$(( bk[k] + 1 ))
+        done < <("${g[@]}" log --since='16 weeks ago' --format=%ct 2>/dev/null)
+        for (( k=0; k<16; k++ )); do
+            (( bk[k] > max )) && max=${bk[k]}
+            sum=$(( sum + bk[k] ))
+        done
+        for (( k=0; k<16; k++ )); do
+            if (( bk[k] == 0 )); then spark+="${C_BRD}▁"
+            else
+                lvl=$(( (bk[k] * 7 + max - 1) / max ))
+                spark+="${GRAD[k*3]}${ticks[lvl]}"
+            fi
+        done
+        if (( w >= 36 )); then
+            L+=("${C_MUT}activity${RST} ${spark}${RST} ${C_MUT}${sum}/16w${RST}")
+        elif (( w >= 26 )); then
+            L+=("${C_MUT}activity${RST} ${spark}${RST}")
+        fi
+
+        # linguaggi per numero di file tracciati; i file senza estensione si
+        # riconoscono dallo shebang (es. gli script in bin/).
+        local -A cnt=()
+        local f base ext first noext=0 files=0
+        while IFS= read -r f; do
+            base=${f##*/}
+            if [[ $base == ?*.* ]]; then
+                ext=${base##*.}; ext=${ext,,}
+            else
+                ext=""
+                if (( noext < 200 )) && [[ -f $p/$f ]]; then
+                    noext=$(( noext + 1 ))
+                    first=""; IFS= read -r first < "$p/$f" 2>/dev/null
+                    case $first in
+                        '#!'*python*) ext=py ;; '#!'*node*) ext=js ;; '#!'*sh*) ext=sh ;;
+                    esac
+                fi
+            fi
+            lang_of "$ext"
+            cnt[$_lang]=$(( ${cnt[$_lang]:-0} + 1 ))
+            files=$(( files + 1 ))
+        done < <("${g[@]}" ls-files 2>/dev/null)
+
+        if (( files > 0 )); then
+            local top=() c lang bw seg used=0 bar="" legend="" legend_len=0 item pct j
+            while read -r c lang; do top+=("$c:$lang"); done < <(
+                for lang in "${!cnt[@]}"; do echo "${cnt[$lang]} $lang"; done | sort -rn | head -n 5)
+            bw=$(( w - 9 )); (( bw > 36 )) && bw=36
+            for (( j=0; j<${#top[@]}; j++ )); do
+                c=${top[j]%%:*}; lang=${top[j]#*:}
+                if (( j == ${#top[@]} - 1 )); then seg=$(( bw - used ))
+                else seg=$(( c * bw / files )); (( seg < 1 )) && seg=1; fi
+                (( used + seg > bw )) && seg=$(( bw - used ))
+                (( seg <= 0 )) && continue
+                spaces "$seg"; bar+="$E[38;2;${LANG_RGB[$lang]}m${_s// /━}"
+                used=$(( used + seg ))
+                pct=$(( (c * 100 + files / 2) / files ))
+                item="● ${lang} ${pct}%"
+                if (( legend_len + ${#item} + 2 <= w - 9 )); then
+                    legend+="$E[38;2;${LANG_RGB[$lang]}m●${C_MUT} ${lang} ${pct}%  "
+                    legend_len=$(( legend_len + ${#item} + 2 ))
+                fi
+            done
+            L+=("${C_MUT}langs${RST}    ${bar}${RST}")
+            L+=("         ${legend}${RST}")
+            ikv files "$C_TXT" "$files tracked" "$w"; L+=("$_kv")
+        fi
+    else
+        L+=("${C_MUT}state${RST}    ${C_MUT}○ non e' un repo git${RST}")
+        local entries=("$p"/*)
+        ikv entries "$C_TXT" "${#entries[@]}" "$w"; L+=("$_kv")
+    fi
+
+    L+=("")
+    local cm="${C_RED}✘" cd="${C_RED}✘"
+    [[ -f $p/CLAUDE.md ]] && cm="${C_GRN}✔"
+    [[ -d $p/.claude ]] && cd="${C_GRN}✔"
+    if (( w >= 30 )); then
+        L+=("${C_MUT}claude${RST}   ${cm} ${C_TXT}CLAUDE.md  ${cd} ${C_TXT}.claude/${RST}")
+    fi
+
+    # ultimi commit come mini grafo: riempie lo spazio che resta nel pannello
+    if (( IS_GIT[i] )); then
+        local h rl s k=0 ago first=1
+        while IFS=$'\x1f' read -r h rl s; do
+            (( first )) && { L+=(""); first=0; }
+            short_rel "$rl"
+            lpad "$_ago" 3; ago=$_l
+            trunc "$s" $(( w - 16 - ${#h} ))
+            if (( k == 0 )); then line="${C_MUT}log${RST}      "; else line="         "; fi
+            L+=("${line}${GRAD[k * 5 % 48]}●${RST} ${C_YLW}${h}${RST} ${C_MUT}${ago}${RST} ${C_TXT}${_t}${RST}")
+            k=$(( k + 1 ))
+        done < <(git -C "$p" log -12 --format='%h%x1f%cr%x1f%s' 2>/dev/null)
+    fi
+
+    INSP=("${L[@]}")
+    CACHE[$key]=$(printf '%s\n' "${L[@]}")
+}
+
+# ── filtro fuzzy ──────────────────────────────────────────────────────────────
+QUERY=""; MODE=normal
+VIEW=(); declare -A MATCH=()
+# Sottosequenza case-insensitive; _m raccoglie le posizioni dei caratteri trovati.
+fuzzy() {
+    local q=${1,,} s=${2,,} i=0 j=0
+    _m=","
+    while (( i < ${#s} && j < ${#q} )); do
+        if [[ ${s:i:1} == "${q:j:1}" ]]; then _m+="$i,"; j=$(( j + 1 )); fi
+        i=$(( i + 1 ))
+    done
+    (( j == ${#q} ))
+}
+refilter() {
+    local i front=() back=()
+    MATCH=()
+    for i in "${!names[@]}"; do
+        if [[ -z $QUERY ]]; then front+=("$i"); continue; fi
+        fuzzy "$QUERY" "${names[i]}" || continue
+        MATCH[$i]=$_m
+        # chi inizia con la query sale in cima, il resto mantiene l'ordine
+        if [[ ${names[i],,} == "${QUERY,,}"* ]]; then front+=("$i"); else back+=("$i"); fi
+    done
+    VIEW=("${front[@]}" "${back[@]}")
+    SEL=0; OFFSET=0
+}
+
+# ── layout ────────────────────────────────────────────────────────────────────
+layout() {
+    read -r ROWS COLS < <(stty size </dev/tty 2>/dev/null || echo "24 80")
+    SHOW_BANNER=0; SHOW_SYS=0
+    if (( ROWS >= 24 && COLS >= BANNER_W + 4 )); then SHOW_BANNER=1; HDR_H=8; else HDR_H=2; fi
+    SX=$(( BANNER_W + 8 ))
+    (( SHOW_BANNER && COLS >= SX + 28 )) && SHOW_SYS=1
+    TOP=$(( HDR_H + 1 ))
+    PH=$(( ROWS - HDR_H - 1 ))
+    (( PH < 4 )) && PH=4
+    LIST_H=$(( PH - 2 ))
+
+    local n maxn=0
+    for n in "${names[@]}"; do (( ${#n} > maxn )) && maxn=${#n}; done
+    if (( COLS < 80 )); then
+        LW=$COLS; RW=0
+    else
+        LW=$(( maxn + 16 ))
+        (( LW < 32 )) && LW=32
+        (( LW > COLS * 42 / 100 )) && LW=$(( COLS * 42 / 100 ))
+        RW=$(( COLS - LW - 1 ))
+    fi
+}
+
+# ── disegno ───────────────────────────────────────────────────────────────────
+PHASE=0; SEL=0; OFFSET=0
+F=""
+
+draw_header() {
+    local r c line ch idx out sw u
+    if (( ! SHOW_BANNER )); then
+        F+="$E[1;1H$E[2K ${GRAD[PHASE]}${BLD}cla2${RST} ${C_MUT}▸ ~/git · ${#names[@]} targets · ${DIRTY_REPOS} dirty${RST}"
+        F+="$E[2;1H$E[2K"
+        return
+    fi
+    for (( r=0; r<6; r++ )); do
+        line=${BANNER[r]}; out=""
+        for (( c=0; c<${#line}; c++ )); do
+            ch=${line:c:1}
+            if [[ $ch == ' ' ]]; then out+=' '; continue; fi
+            idx=$(( (c + r * 2 - PHASE + 48) % 48 ))
+            if [[ $ch == '█' ]]; then out+="${GRAD[idx]}$ch"; else out+="${GRAD_DIM[idx]}$ch"; fi
+        done
+        F+="$E[$(( r + 1 ));1H$E[2K  ${out}${RST}"
+    done
+    F+="$E[7;1H$E[2K  ${C_MUT}~/git ${C_BRD}·${C_MUT} ${#names[@]} targets ${C_BRD}·${C_MUT} ${DIRTY_REPOS} dirty ${C_BRD}·${C_MUT} v2${RST}"
+    F+="$E[8;1H$E[2K"
+
+    (( SHOW_SYS )) || return
+    sw=$(( COLS - SX - 1 ))
+    u="${USER:-user}@${HOST}"
+    trunc "$u" "$sw"
+    F+="$E[1;${SX}H${C_PNK}${BLD}${USER:-user}${NOB}${C_MUT}@${C_CYN}${BLD}${HOST}${RST}"
+    hr $(( ${#u} < sw ? ${#u} : sw )); F+="$E[2;${SX}H${C_BRD}${_hr}${RST}"
+    ikv os "$C_TXT" "$OS_NAME" "$sw";                      F+="$E[3;${SX}H$_kv"
+    ikv kernel "$C_TXT" "$KERNEL" "$sw";                   F+="$E[4;${SX}H$_kv"
+    ikv claude "$C_TXT" "$CLAUDE_VER" "$sw";               F+="$E[5;${SX}H$_kv"
+    ikv uptime "$C_TXT" "$SYS_UP · load $SYS_LOAD" "$sw";  F+="$E[6;${SX}H$_kv"
+    if (( sw >= 30 )); then
+        meter "$SYS_MEM" 12
+        F+="$E[7;${SX}H${C_MUT}mem${RST}      ${_m} ${C_TXT}${SYS_MEM}%${RST}"
+    fi
+    # la classica striscia di colori alla neofetch: i colori di /color
+    out=""
+    for c in "${PALETTE[@]}"; do out+="$E[38;2;${CRGB[$c]}m███"; done
+    (( sw >= 24 )) && F+="$E[8;${SX}H${out}${RST}"
+}
+
+# Una riga della lista, larga esattamente LW-2 colonne → _row
+list_row() {
+    local vi=$1 i=${VIEW[$1]} iw=$(( LW - 2 )) nw sel=0 out num numc icon iconc nm m k ch namec st stc rest
+    (( vi == SEL )) && sel=1
+    nw=$(( iw - 12 ))
+    trunc "${names[i]}" "$nw"; nm=$_t
+
+    printf -v num '%2d' $(( vi + 1 ))
+    if (( vi < 9 )); then numc=$C_YLW; else numc=$C_BRD; fi
+    if (( i == 0 )); then icon=$G_CWD; iconc=$C_YLW
+    elif (( IS_GIT[i] )); then icon=$G_GIT; iconc="$E[38;2;${CRGB[${PCOLOR[i]}]}m"
+    else icon=$G_DIR; iconc=$C_MUT; fi
+
+    out=""
+    (( sel )) && out+="$E[48;2;${R_SEL}m${C_PNK}▌" || out+=" "
+    out+="${numc}${num} ${iconc}${icon} "
+    if (( sel )); then namec="${C_WHT}${BLD}"; else namec=$C_TXT; fi
+    m=${MATCH[$i]:-}
+    if [[ -z $m ]]; then
+        out+="${namec}${nm}"
+    else
+        for (( k=0; k<${#nm}; k++ )); do
+            ch=${nm:k:1}
+            if [[ $m == *",$k,"* ]]; then out+="${C_YLW}${BLD}${ch}${NOB}"; else out+="${namec}${ch}"; fi
+        done
+    fi
+    out+=$NOB
+    rest=$(( nw - ${#nm} ))
+    if (( i == 0 && rest >= 5 )); then out+="${C_MUT} cwd"; rest=$(( rest - 4 )); fi
+    spaces "$rest"; out+=$_s
+
+    if (( ! IS_GIT[i] )); then st="·"; stc=$C_BRD
+    elif (( DIRTY[i] > 0 )); then st="✚${DIRTY[i]}"; stc=$C_YLW
+    else st="✔"; stc=$C_GRN; fi
+    lpad "$st" 5
+    out+="${stc}${_l} ${RST}"
+    _row=$out
+}
+
+draw_panels() {
+    local r row vi title tag fill thumb=0 tpos=0 sb n=${#VIEW[@]} iw=$(( LW - 2 )) w
+    # tieni la selezione nel viewport
+    (( SEL < OFFSET )) && OFFSET=$SEL
+    (( SEL >= OFFSET + LIST_H )) && OFFSET=$(( SEL - LIST_H + 1 ))
+
+    # ── bordo superiore sinistro
+    if [[ $MODE == search ]]; then title=" /${QUERY}▏ "; else title=" PROJECTS "; fi
+    tag=" $(( n ? SEL + 1 : 0 ))/${n} "
+    fill=$(( LW - 3 - ${#title} - ${#tag} - 1 ))
+    if (( fill < 0 )); then tag=""; fill=$(( LW - 4 - ${#title} )); fi
+    hr "$fill"
+    if [[ $MODE == search ]]; then title="${C_CYN}${BLD}${title}${RST}"; else title="${C_PNK}${BLD}${title}${RST}"; fi
+    F+="$E[${TOP};1H${C_BRD}╭─${title}${C_BRD}${_hr}${C_MUT}${tag}${C_BRD}─╮${RST}"
+
+    # scrollbar sul bordo destro se la lista non ci sta
+    if (( n > LIST_H )); then
+        thumb=$(( LIST_H * LIST_H / n )); (( thumb < 1 )) && thumb=1
+        tpos=$(( OFFSET * (LIST_H - thumb) / (n - LIST_H) ))
+    fi
+
+    for (( r=0; r<LIST_H; r++ )); do
+        row=$(( TOP + 1 + r )); vi=$(( OFFSET + r ))
+        F+="$E[${row};1H${C_BRD}│${RST}"
+        if (( vi < n )); then
+            list_row "$vi"; F+="$_row"
+        elif (( n == 0 && r == 1 )); then
+            trunc "  ∅ nessun match" "$iw"; spaces $(( iw - ${#_t} )); F+="${C_MUT}${_t}${_s}${RST}"
+        else
+            spaces "$iw"; F+="$_s"
+        fi
+        if (( thumb > 0 && r >= tpos && r < tpos + thumb )); then sb="${C_PNK}┃"; else sb="${C_BRD}│"; fi
+        F+="$E[${row};${LW}H${sb}${RST}"
+        (( RW > 0 )) && F+=" "
+    done
+    hr $(( LW - 2 ))
+    F+="$E[$(( TOP + PH - 1 ));1H${C_BRD}╰${_hr}╯${RST}"
+    (( RW > 0 )) && F+=" "
+
+    (( RW > 0 )) || return
+    # ── inspector
+    local x=$(( LW + 2 ))
+    w=$(( RW - 4 ))
+    if (( n > 0 )); then
+        inspect "${VIEW[SEL]}" "$w"
+        title=" INSPECT ▸ ${names[${VIEW[SEL]}]} "
+    else
+        INSP=(); title=" INSPECT "
+    fi
+    trunc "$title" $(( RW - 6 )); title=$_t
+    hr $(( RW - 4 - ${#title} ))
+    F+="$E[${TOP};${x}H${C_BRD}╭─${C_CYN}${BLD}${title}${RST}${C_BRD}${_hr}─╮${RST}"
+    for (( r=0; r<LIST_H; r++ )); do
+        row=$(( TOP + 1 + r ))
+        F+="$E[${row};${x}H${C_BRD}│${RST}$E[$(( RW - 2 ))X ${INSP[r]:-}${RST}$E[${row};${COLS}H${C_BRD}│${RST}"
+    done
+    hr $(( RW - 2 ))
+    F+="$E[$(( TOP + PH - 1 ));${x}H${C_BRD}╰${_hr}╯${RST}"
+}
+
+# Status bar in stile powerline: segmenti colorati separati da .
+PL=""; PL_LEN=0; PL_BG=""
+pl_seg() {  # $1 testo, $2 bg "r;g;b", $3 fg "r;g;b"
+    if [[ -n $PL_BG ]]; then PL+="$E[38;2;${PL_BG}m$E[48;2;$2m${G_SEP_R}"; PL_LEN=$(( PL_LEN + 1 )); fi
+    PL+="$E[48;2;$2m$E[38;2;$3m$1"; PL_LEN=$(( PL_LEN + ${#1} )); PL_BG=$2
+}
+HINTS=""; HLEN=0
+hint() { HINTS+="${C_TXT}${BLD}$1${NOB}${C_MUT} $2  "; HLEN=$(( HLEN + ${#1} + ${#2} + 3 )); }
+
+draw_status() {
+    local clock fill
+    PL=""; PL_LEN=0; PL_BG=""
+    if [[ $MODE == search ]]; then pl_seg " ${G_SEARCH} SEARCH " "$R_CYN" "$R_DRK"
+    else pl_seg " ${G_TERM} NORMAL " "$R_PNK" "$R_DRK"; fi
+    pl_seg " ${#VIEW[@]}/${#names[@]} " "$R_SEG" "$R_TXT"
+    if [[ $REMOTE_CONTROL == true ]]; then pl_seg " ${G_WIFI} RC ON " "$R_GRN" "$R_DRK"
+    else pl_seg " ${G_WIFI} RC OFF " "$R_SEG" "$R_MUT"; fi
+    if [[ $CHROME == true ]]; then pl_seg " ${G_CHROME} CHROME ON " "$R_GRN" "$R_DRK"
+    else pl_seg " ${G_CHROME} CHROME OFF " "$R_SEG" "$R_MUT"; fi
+    PL+="$E[38;2;${PL_BG}m$E[48;2;${R_BAR}m${G_SEP_R}"; PL_LEN=$(( PL_LEN + 1 ))
+
+    printf -v clock ' %(%H:%M:%S)T ' -1
+    HINTS=""; HLEN=0
+    if [[ $MODE == search ]]; then
+        hint "type" "filtra"; hint "↑↓" "muovi"; hint "⏎" "lancia"; hint "esc" "annulla"
+    else
+        hint "↑↓/jk" "muovi"; hint "⏎" "lancia"; hint "1-9" "rapido"; hint "/" "cerca"
+        hint "r" "remote"; hint "c" "chrome"; hint "a" "anim"; hint "q" "esci"
+    fi
+    fill=$(( COLS - PL_LEN - HLEN - ${#clock} - 1 ))
+    if (( fill < 1 )); then HINTS=""; HLEN=0; fill=$(( COLS - PL_LEN - ${#clock} - 1 )); fi
+    if (( fill < 0 )); then clock=""; fill=$(( COLS - PL_LEN )); fi
+    spaces "$fill"
+    F+="$E[${ROWS};1H${PL}$E[48;2;${R_BAR}m${_s}${HINTS}"
+    [[ -n $clock ]] && F+="$E[38;2;${R_PUR}m${G_SEP_L}$E[48;2;${R_PUR}m$E[38;2;${R_DRK}m${BLD}${clock}"
+    F+=$RST
+}
+
+draw_full() {
+    F=""
+    if (( ROWS < 10 || COLS < 40 )); then
+        F="$E[H$E[2J${C_PNK}terminale troppo piccolo (${COLS}x${ROWS})${RST}"
+    else
+        draw_header; draw_panels; draw_status
+    fi
+    printf '%s' "$F"
+}
+draw_tick() {
+    (( ROWS < 10 || COLS < 40 )) && return
+    F=""; draw_header; draw_status; printf '%s' "$F"
+}
+
+# ── lancio ────────────────────────────────────────────────────────────────────
+IN_TUI=0
+tui_on()  { printf '\033[?1049h\033[?25l'; stty -echo 2>/dev/null; IN_TUI=1; }
+mouse_on() { printf '\033[?1000h\033[?1006h'; }
+tui_off() {
+    (( IN_TUI )) || return 0
+    printf '\033[?1000l\033[?1006l\033[0m\033[?25h\033[?1049l'
+    stty echo 2>/dev/null
+    IN_TUI=0
+}
+
+step() {  # $1 esito (ok|warn|off), $2 etichetta, $3 dettaglio
+    local tag
+    case $1 in
+        ok)   tag="${C_GRN}[ OK ]" ;;
+        warn) tag="${C_YLW}[WARN]" ;;
+        *)    tag="${C_MUT}[ -- ]" ;;
+    esac
+    printf '  %s%s %s%-16s%s %s%s\n' "$tag" "$RST" "$C_TXT" "$2" "$RST" "$3" "$RST"
+}
+
+# readline conta anche i codici colore nel prompt se non sono racchiusi in \001..\002
+rl() { printf '\001%s\002' "$1"; }
+
+launch_claude() {
+    local path="$1" name="$2" color pc rename_text claude_args=() tmp pid st last k cols
+    local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+    # Il colore resta legato al nome della cartella, non al nome della sessione.
+    color="$(project_color "$name")"
+    pc="$E[38;2;${CRGB[$color]}m"
+    cols=$(tput cols 2>/dev/null || echo 80)
+
+    printf '\n  %s▌%s %scla2%s %s▸ launch sequence%s\n\n' "$C_PNK" "$RST" "$BLD" "$RST" "$C_MUT" "$RST"
+    printf '  %starget %s  %s%s%s\n' "$C_MUT" "$RST" "$C_CYN" "${path/#$HOME/\~}" "$RST"
+    printf '  %scolor  %s  %s██%s %s\n' "$C_MUT" "$RST" "$pc" "$RST" "$color"
+
+    # La CLI di claude accetta un solo prompt iniziale, gia' occupato da
+    # "/color": il nome sessione (equivalente a /rename) si imposta con -n.
+    printf '\033[?25h'
+    read -e -r -i "$name" -p "  $(rl "$C_MUT")session$(rl "$RST")  $(rl "$C_PNK")❯$(rl "$RST") " rename_text || true
+    rename_text="${rename_text:-$name}"
+    echo
+
+    if [ "$REMOTE_CONTROL" = true ]; then
+        claude_args+=(--remote-control "$rename_text")
+        step ok "remote control" "${C_MUT}armed as ${C_TXT}${rename_text}"
+    else
+        step off "remote control" "${C_MUT}off"
+    fi
+    if [ "$CHROME" = true ]; then
+        claude_args+=(--chrome)
+        step ok "chrome" "${C_MUT}bridge on"
+    else
+        step off "chrome" "${C_MUT}off"
+    fi
+
+    cd "$path" || exit 1
+
+    if git rev-parse --is-inside-work-tree &>/dev/null; then
+        # In background per lo spinner; niente prompt di credenziali che
+        # finirebbero mescolati all'animazione, e un timeout per non restare appesi.
+        tmp=$(mktemp)
+        GIT_TERMINAL_PROMPT=0 timeout 30 git pull --ff-only >"$tmp" 2>&1 &
+        pid=$!
+        printf '\033[?25l'
+        k=0
+        while kill -0 "$pid" 2>/dev/null; do
+            printf '\r  %s[ %s%s%s  ]%s %s%-16s%s %s--ff-only%s' "$C_MUT" "$C_CYN" "${frames[k % 10]}" "$C_MUT" "$RST" \
+                "$C_TXT" "git pull" "$RST" "$C_MUT" "$RST"
+            k=$(( k + 1 ))
+            sleep 0.08
+        done
+        wait "$pid"; st=$?
+        last=$(grep -v '^[[:space:]]*$' "$tmp" | tail -n1)
+        rm -f "$tmp"
+        trunc "$last" $(( cols - 30 )); last=$_t
+        printf '\r\033[K'
+        if (( st == 0 )); then
+            step ok "git pull" "${C_MUT}${last}"
+        else
+            step warn "git pull" "${C_YLW}fallito, procedo comunque ${C_MUT}${last}"
+        fi
+    else
+        step off "git pull" "${C_MUT}non e' un repo git"
+    fi
+    step ok "claude" "${C_MUT}${CLAUDE_VER}"
+
+    # barra di "warp" prima di passare la mano a claude
+    printf '\n  '
+    for (( k=0; k<32; k++ )); do
+        printf '%s▰' "${GRAD[k * 48 / 32]}"
+        sleep 0.006
+    done
+    printf '%s %sengage%s\n' "$RST" "$C_PNK$BLD" "$RST"
+
+    local shown
+    shown=$(printf '%q ' "${claude_args[@]}" -n "$rename_text" "/color $color")
+    printf '\n  %s⟫%s %sexec%s claude %s%s%s\n\n' "$C_PNK" "$RST" "$C_MUT" "$RST" "$C_MUT" "$shown" "$RST"
+    printf '\033[?25h'
+    exec "$CLAUDE_BIN" "${claude_args[@]}" -n "$rename_text" "/color $color"
+}
+
+# ── fallback senza terminale interattivo (piped/redirect) ─────────────────────
+if [ ! -t 0 ]; then
+    PS3="Scegli un progetto: "
+    select name in "${names[@]}"; do
+        [ -n "${name:-}" ] && break
+        echo "Scelta non valida."
+    done
+    idx=$((REPLY - 1))
+    launch_claude "${paths[$idx]}" "${names[$idx]}"
+fi
+
+# ── main loop ─────────────────────────────────────────────────────────────────
+trap tui_off EXIT
+trap 'exit 130' INT TERM
+RESIZED=0
+trap 'RESIZED=1' WINCH
+
+tui_on
+layout
+boot
+mouse_on
+refilter
+printf '\033[H\033[2J'
+draw_full
+
+LAUNCH=-1
+move() {  # $1 delta
+    local n=${#VIEW[@]}
+    (( n == 0 )) && return
+    SEL=$(( (SEL + $1 + n * 100) % n ))
+}
+
+# Mouse SGR (ESC [ < b ; x ; y M): click seleziona, secondo click sulla stessa
+# voce lancia, rotella scorre.
+handle_mouse() {
+    local seq="" ch b x y vi
+    while IFS= read -rsn1 -t 0.05 ch; do
+        seq+=$ch
+        [[ $ch == [Mm] ]] && break
+    done
+    [[ $seq == *M ]] || return 0      # rilascio o sequenza incompleta
+    IFS=';' read -r b x y <<<"${seq%M}"
+    case $b in
+        64) move -1 ;;
+        65) move 1 ;;
+        0)
+            if (( x <= LW && y > TOP && y < TOP + PH - 1 )); then
+                vi=$(( OFFSET + y - TOP - 1 ))
+                if (( vi < ${#VIEW[@]} )); then
+                    if (( vi == SEL )); then LAUNCH=$vi; else SEL=$vi; fi
+                fi
+            fi
+            ;;
+    esac
+}
+
+handle_key() {
+    local key=$1 k2 k3 k4
+    if [[ $key == $'\x1b' ]]; then
+        if ! IFS= read -rsn1 -t 0.02 k2; then
+            # Esc da solo: esce dalla ricerca, o dal programma
+            if [[ $MODE == search ]]; then MODE=normal; QUERY=""; refilter; else exit 0; fi
+            return
+        fi
+        if [[ $k2 == '[' || $k2 == 'O' ]]; then
+            IFS= read -rsn1 -t 0.02 k3
+            case $k3 in
+                A) move -1 ;;
+                B) move 1 ;;
+                H) SEL=0 ;;
+                F) SEL=$(( ${#VIEW[@]} ? ${#VIEW[@]} - 1 : 0 )) ;;
+                5) IFS= read -rsn1 -t 0.02 k4; move $(( -LIST_H )) ;;
+                6) IFS= read -rsn1 -t 0.02 k4; move "$LIST_H" ;;
+                '<') handle_mouse ;;
+            esac
+        fi
+        return
+    fi
+    if [[ -z $key ]]; then
+        (( ${#VIEW[@]} > 0 )) && LAUNCH=$SEL
+        return
+    fi
+
+    if [[ $MODE == search ]]; then
+        case $key in
+            $'\x7f'|$'\x08')
+                if [[ -n $QUERY ]]; then QUERY=${QUERY:0:-1}; refilter
+                else MODE=normal; fi ;;
+            $'\t') move 1 ;;
+            [[:print:]]) QUERY+=$key; refilter ;;
+        esac
+        return
+    fi
+
+    case $key in
+        j) move 1 ;;
+        k) move -1 ;;
+        g) SEL=0 ;;
+        G) SEL=$(( ${#VIEW[@]} ? ${#VIEW[@]} - 1 : 0 )) ;;
+        /) MODE=search ;;
+        r|R) [[ $REMOTE_CONTROL == true ]] && REMOTE_CONTROL=false || REMOTE_CONTROL=true ;;
+        c|C) [[ $CHROME == true ]] && CHROME=false || CHROME=true ;;
+        a|A) [[ $ANIM == true ]] && ANIM=false || ANIM=true ;;
+        q|Q) exit 0 ;;
+        [1-9]) (( key - 1 < ${#VIEW[@]} )) && { SEL=$(( key - 1 )); LAUNCH=$SEL; } ;;
+    esac
+}
+
+TICKS=0
+while true; do
+    if [[ $ANIM == true ]]; then tick=0.1; else tick=1; fi
+    if IFS= read -rsn1 -t "$tick" key; then
+        handle_key "$key"
+        if (( LAUNCH >= 0 )); then
+            draw_full
+            idx=${VIEW[LAUNCH]}
+            tui_off
+            launch_claude "${paths[$idx]}" "${names[$idx]}"
+        fi
+        draw_full
+    else
+        (( $? > 128 )) || exit 0   # EOF su stdin
+        if (( RESIZED )); then
+            RESIZED=0; layout; printf '\033[H\033[2J'; draw_full; continue
+        fi
+        TICKS=$(( TICKS + 1 ))
+        [[ $ANIM == true ]] && PHASE=$(( (PHASE + 1) % 48 ))
+        (( TICKS % 20 == 0 )) && sys_dynamic
+        draw_tick
+    fi
+done
