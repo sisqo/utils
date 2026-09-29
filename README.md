@@ -81,3 +81,51 @@ color (a color picked in `cla2` applies to `cla2` only).
 - A powerline status bar and a **launch sequence**: session rename, then
   `git pull` with a spinner, then the `exec` line before `claude` starts.
 - Needs a truecolor terminal and a Nerd Font for the icons.
+
+### `bin/vmclean`
+
+Frees disk space on this VM by clearing caches and leftovers, always showing a
+preview first. Nothing is deleted until you pick what to remove and confirm.
+
+- Styled like `cla2`: a gradient banner with host and disk info, a
+  `dmesg`-style scan log, framed panels with size bars, a powerline summary,
+  and `[ OK ]` steps with a spinner while deleting. `VMCLEAN_NOANIM=1` skips
+  the animations, `NO_COLOR=1` (or piping the output) drops the colors.
+- The preview lists every category with its size and what's inside (paths,
+  snap revisions, log files, orphan packages). It needs no `sudo`.
+- **Recommended** categories are safely regenerable: npm/npx and pip caches,
+  thumbnails, old Claude Code versions and installer downloads, the Claude
+  Desktop and VS Code caches, leftover Chrome headless profiles, disabled snap
+  revisions, the apt cache, orphan apt packages, leftovers of removed packages
+  (`dpkg --purge` of `rc` packages, `/lib/modules` dirs of uninstalled
+  kernels), the systemd journal (vacuumed to 200M), rotated logs in
+  `/var/log`, and `/var/crash`.
+- **Optional** ones have a cost, which the preview spells out: the active
+  JetBrains IDE's cache (forces a full reindex), Playwright/Puppeteer browsers,
+  Chrome's and Chromium's disk caches, `.next` build dirs under `~/git`, the
+  unpacked Hyprland source trees in `~/src/hypr/w` (`build.sh` re-fetches
+  them; `.deb`s and tarballs stay), the `tmp` dirs of finished, unpinned
+  Claude jobs, uninstalling the Chromium snap altogether (`snap remove
+  --purge`, profile included), old JetBrains versions' dirs, the Trash, and
+  the clipboard history (`cliphist wipe`). Picking the Chromium uninstall
+  drops its cache category, and totals don't count the overlap twice.
+- It never touches sessions and config in `~/.claude`, the active Claude Code
+  version (nor one a running session is still executing), project
+  `node_modules`, or installed kernels (old ones are filtered out of the
+  orphan packages).
+- It skips a category when the program using it is running (Chrome,
+  Chromium, Claude Desktop, VS Code, the JetBrains IDE, a Next.js server, a
+  test browser, an MCP server started through `npx`). Its own parent
+  processes don't count, so launching it from a shell whose command line
+  mentions those names doesn't trigger a skip.
+- At the prompt: `c` for the recommended categories, `t` for all of them,
+  numbers like `1 3 5` to pick, Enter for nothing. A recap panel and a final
+  `[s/N]` confirm it. `sudo` is only requested then, and only if a chosen
+  category needs it. Each step then reports the space it actually freed.
+
+Usage:
+
+```sh
+vmclean            # preview, then choose what to delete
+vmclean --preview  # preview only
+```

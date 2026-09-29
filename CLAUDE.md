@@ -15,6 +15,10 @@ Current scripts:
   chosen one.
 - `bin/cla2`: the same launcher as a full-screen truecolor TUI. `cla` stays
   independent of it: when asked to change `cla2`, don't touch `cla`.
+- `bin/vmclean`: disk cleanup for this VM (caches, old snap revisions, logs),
+  preview first, styled after `cla2`. When testing, run deletions only against
+  a scratch `HOME` with `sudo`, `snap`, `apt-get`, `journalctl` and `cliphist`
+  stubbed in `PATH`, never for real.
 
 ## Conventions
 

@@ -1,0 +1,972 @@
+#!/usr/bin/env bash
+# vmclean — pulizia dei file non necessari della VM, con anteprima prima di cancellare.
+#
+# Senza argomenti: calcola cosa si puo' liberare, mostra l'anteprima e chiede cosa
+# eliminare (di default niente). Con -n / --preview mostra solo l'anteprima ed esce.
+# L'anteprima non richiede sudo: sudo serve solo in fase di cancellazione.
+# Lo stile (colori, gradiente, glifi, status bar) riprende quello di cla2.
+set -uo pipefail
+
+PREVIEW_ONLY=false
+# Dimensione a cui ridurre il journal di systemd.
+JOURNAL_KEEP="200M"
+
+usage() {
+    cat <<EOF
+Uso: vmclean [-n|--preview] [-h|--help]
+
+  (nessuna opzione)  mostra l'anteprima e chiede cosa eliminare
+  -n, --preview      mostra solo l'anteprima, senza cancellare niente
+  -h, --help         questo aiuto
+
+VMCLEAN_NOANIM=1 salta le animazioni, NO_COLOR=1 toglie i colori.
+EOF
+}
+
+case "${1:-}" in
+    "") ;;
+    -n|--preview) PREVIEW_ONLY=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+H="${HOME:?HOME non impostata}"
+
+# ── terminale ─────────────────────────────────────────────────────────────────
+TTY=0; [[ -t 1 ]] && TTY=1
+ANIM=$TTY; [[ -n ${VMCLEAN_NOANIM:-} ]] && ANIM=0
+COLS=$(tput cols 2>/dev/null || echo 80); [[ $COLS =~ ^[0-9]+$ ]] || COLS=80
+(( TTY )) || COLS=100
+# Larghezza dei riquadri (bordi compresi) e larghezza utile al loro interno.
+W=$(( COLS - 2 < 100 ? COLS - 2 : 100 ))
+IW=$(( W - 4 ))
+BARW=0; (( IW >= 60 )) && BARW=10
+
+# ── colori (truecolor, stessa tavolozza di cla2) ──────────────────────────────
+E=$'\033'
+R_TXT="205;214;244"; R_MUT="108;112;134"; R_BRD="69;71;90"
+R_CYN="0;229;255";   R_PNK="255;46;151";  R_PUR="176;75;255";  R_GRN="57;255;130"
+R_YLW="255;214;10";  R_RED="255;85;85";   R_DRK="17;17;27";    R_SEG="49;50;68"
+COLOR=0; (( TTY )) && [[ -z ${NO_COLOR:-} ]] && COLOR=1
+if (( COLOR )); then
+    RST="$E[0m"; BLD="$E[1m"; NOB="$E[22m"
+    for c in TXT MUT BRD CYN PNK PUR GRN YLW RED; do
+        v="R_$c"; printf -v "C_$c" '\033[38;2;%sm' "${!v}"
+    done
+else
+    RST=""; BLD=""; NOB=""
+    for c in TXT MUT BRD CYN PNK PUR GRN YLW RED; do printf -v "C_$c" '%s' ""; done
+fi
+
+# Gradiente ciclico ciano → viola → rosa → ciano, 48 passi (come in cla2).
+GRAD=(); GRAD_DIM=()
+stops=("0 229 255" "176 75 255" "255 46 151" "0 229 255")
+for (( s=0; s<3; s++ )); do
+    read -r r1 g1 b1 <<<"${stops[s]}"
+    read -r r2 g2 b2 <<<"${stops[s+1]}"
+    for (( t=0; t<16; t++ )); do
+        r=$(( r1 + (r2-r1)*t/16 )); g=$(( g1 + (g2-g1)*t/16 )); b=$(( b1 + (b2-b1)*t/16 ))
+        if (( COLOR )); then
+            printf -v esc '\033[38;2;%d;%d;%dm' "$r" "$g" "$b"; GRAD+=("$esc")
+            printf -v esc '\033[38;2;%d;%d;%dm' $((r*45/100)) $((g*45/100)) $((b*45/100)); GRAD_DIM+=("$esc")
+        else
+            GRAD+=(""); GRAD_DIM+=("")
+        fi
+    done
+done
+
+# Glifi Nerd Font (JetBrainsMono Nerd Font Mono: 1 cella l'uno).
+G_SEP_R=$''; G_SEP_L=$''
+G_LOCK=$'';  G_DISK=$'';  G_OK=$'';  G_WARN=$''
+G_BAN=$'';   G_RECYCLE=$''; G_SHIELD=$''
+
+BANNER=(
+    "██╗   ██╗███╗   ███╗ ██████╗██╗     ███████╗ █████╗ ███╗   ██╗"
+    "██║   ██║████╗ ████║██╔════╝██║     ██╔════╝██╔══██╗████╗  ██║"
+    "██║   ██║██╔████╔██║██║     ██║     █████╗  ███████║██╔██╗ ██║"
+    "╚██╗ ██╔╝██║╚██╔╝██║██║     ██║     ██╔══╝  ██╔══██║██║╚██╗██║"
+    " ╚████╔╝ ██║ ╚═╝ ██║╚██████╗███████╗███████╗██║  ██║██║ ╚████║"
+    "  ╚═══╝  ╚═╝     ╚═╝ ╚═════╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝"
+)
+BANNER_W=${#BANNER[0]}
+
+TMPD=$(mktemp -d)
+cleanup() { (( TTY )) && printf '\033[?25h'; rm -rf -- "$TMPD"; }
+trap cleanup EXIT
+trap 'echo; exit 130' INT
+
+# ── helper di testo ───────────────────────────────────────────────────────────
+# Come in cla2: il testo si tronca *prima* di colorarlo, cosi' la larghezza
+# visibile e' sempre nota e nessuna riga sfora il bordo dei riquadri.
+trunc() {  # $1 testo, $2 larghezza → _t
+    local s=$1 w=$2
+    if (( w <= 0 )); then _t=""
+    elif (( ${#s} > w )); then _t="${s:0:w-1}…"
+    else _t=$s; fi
+}
+spaces() { printf -v _s '%*s' "$(( $1 > 0 ? $1 : 0 ))" ''; }
+hr()     { spaces "$1"; _hr=${_s// /─}; }
+lpad()   { spaces $(( $2 - ${#1} )); _l="$_s$1"; }
+rpad()   { spaces $(( $2 - ${#1} )); _r="$1$_s"; }
+
+human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
+
+# Barra ▰▱ colorata verde → giallo → rosso in base alla percentuale (da cla2).
+meter() {  # $1 percentuale, $2 celle → _m
+    local pct=$1 n=$2 on k col
+    on=$(( (pct * n + 50) / 100 ))
+    _m=""
+    for (( k=0; k<n; k++ )); do
+        if (( k < on )); then
+            if (( k < n/2 )); then col=$C_GRN; elif (( k < n*8/10 )); then col=$C_YLW; else col=$C_RED; fi
+            _m+="${col}▰"
+        else
+            _m+="${C_BRD}▱"
+        fi
+    done
+    _m+=$RST
+}
+
+# Barra a gradiente proporzionale alla categoria piu' grande.
+gbar() {  # $1 valore, $2 massimo, $3 celle → _b
+    local v=$1 max=$2 n=$3 on k
+    (( max > 0 )) || max=1
+    on=$(( (v * n + max / 2) / max ))
+    (( v > 0 && on == 0 )) && on=1
+    _b=""
+    for (( k=0; k<n; k++ )); do
+        if (( k < on )); then _b+="${GRAD[k * 32 / n]}▰"; else _b+="${C_BRD}▱"; fi
+    done
+    _b+=$RST
+}
+
+# ── riquadri ──────────────────────────────────────────────────────────────────
+box_top() {  # $1 titolo, $2 colore del titolo
+    local t=" $1 "
+    hr $(( W - 3 - ${#t} ))
+    printf ' %s╭─%s%s%s%s%s%s╮%s\n' "$C_BRD" "$RST" "$2$BLD" "$t" "$RST" "$C_BRD" "$_hr" "$RST"
+}
+box_line() {  # $1 contenuto colorato, $2 sua larghezza visibile
+    spaces $(( IW - $2 ))
+    printf ' %s│%s %s%s %s│%s\n' "$C_BRD" "$RST" "$1" "$_s" "$C_BRD" "$RST"
+}
+box_bot() { hr $(( W - 2 )); printf ' %s╰%s╯%s\n' "$C_BRD" "$_hr" "$RST"; }
+
+# Segmenti powerline, come la status bar di cla2 (senza colori: [ a | b ]).
+PL=""; PL_BG=""
+pl_seg() {  # $1 testo, $2 bg "r;g;b", $3 fg "r;g;b"
+    if (( ! COLOR )); then PL+="${PL:+|}$1"; return; fi
+    [[ -n $PL_BG ]] && PL+="$E[38;2;${PL_BG}m$E[48;2;$2m${G_SEP_R}"
+    PL+="$E[48;2;$2m$E[38;2;$3m$1"; PL_BG=$2
+}
+pl_end() {
+    if (( COLOR )); then PL+="$E[0m$E[38;2;${PL_BG}m${G_SEP_R}$RST"; else PL="[$PL]"; fi
+    printf '  %s\n' "$PL"; PL=""; PL_BG=""
+}
+
+hint() { printf '%s%s%s%s %s%s  ' "$C_TXT" "$BLD" "$1" "$NOB" "$C_MUT" "$2"; }
+
+# ── utilita' di sistema ───────────────────────────────────────────────────────
+
+# Somma in byte delle dimensioni dei percorsi esistenti (quelli mancanti valgono 0).
+size_of() {
+    local p total=0 s
+    for p in "$@"; do
+        [[ -e "$p" ]] || continue
+        s=$(du -sb -- "$p" 2>/dev/null | cut -f1)
+        total=$((total + ${s:-0}))
+    done
+    echo "$total"
+}
+
+# Svuota una cartella lasciandola in piedi (i programmi si aspettano che esista).
+empty_dir() {
+    local d="$1"
+    [[ -d "$d" && "$d" == /* && "$d" != / ]] || return 0
+    find "$d" -mindepth 1 -delete
+}
+
+# Processi antenati di vmclean (la shell o il terminale che l'ha lanciato): la
+# loro riga di comando puo' contenere i nomi cercati, e non vanno contati. Lo
+# stesso vale per le loro copie (bash crea sottoshell per gli elementi di una
+# pipe), riconoscibili perche' hanno la stessa riga di comando.
+ANCESTORS=" "; ANCESTOR_CMDS=()
+_p=$$
+while [[ $_p =~ ^[0-9]+$ ]] && (( _p > 1 )); do
+    ANCESTORS+="$_p "
+    ANCESTOR_CMDS+=("$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null)")
+    _st=$(< "/proc/$_p/stat") 2>/dev/null || break
+    _st=${_st##*) }; read -r _ _p _ <<<"$_st"
+done
+
+running() {
+    local pid cmd a
+    for pid in $(pgrep -f -- "$1" 2>/dev/null); do
+        [[ $ANCESTORS == *" $pid "* ]] && continue
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+        for a in "${ANCESTOR_CMDS[@]}"; do [[ $cmd == "$a" ]] && continue 2; done
+        return 0
+    done
+    return 1
+}
+
+# Le funzioni run_* segnalano cosi' qualcosa da mostrare sotto il passo.
+note() { echo "NOTA: $*"; }
+
+disk_avail() { df -B1 --output=avail / | tail -1 | tr -d ' '; }
+disk_pct()   { df --output=pcent / | tail -1 | tr -dc '0-9'; }
+
+# ── cartelle JetBrains ────────────────────────────────────────────────────────
+# Le cartelle per-versione hanno la forma <Prodotto><anno>.<n> (es. IntelliJIdea2026.1);
+# per ogni prodotto la versione piu' recente e' quella in uso, le altre sono vecchie.
+JB_BASES=("$H/.cache/JetBrains" "$H/.config/JetBrains" "$H/.local/share/JetBrains")
+
+jb_versioned() {
+    local base
+    for base in "${JB_BASES[@]}"; do
+        [[ -d "$base" ]] || continue
+        find "$base" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+            -regex '.*/[A-Za-z]+[0-9]{4}\.[0-9]+' -printf '%f\n'
+    done | sort -u
+}
+
+# Versione piu' recente per ogni prodotto.
+jb_latest() {
+    jb_versioned | sed -E 's/^([A-Za-z]+)([0-9]{4}\.[0-9]+)$/\1 \2/' \
+        | sort -k1,1 -k2,2V | awk '{last[$1]=$1$2} END {for (p in last) print last[p]}'
+}
+
+jb_old_paths() {
+    local latest base d
+    latest=$(jb_latest)
+    for base in "${JB_BASES[@]}"; do
+        [[ -d "$base" ]] || continue
+        while IFS= read -r d; do
+            grep -qxF -- "$d" <<<"$latest" || echo "$base/$d"
+        done < <(jb_versioned)
+    done | while IFS= read -r d; do [[ -d "$d" ]] && echo "$d"; done
+}
+
+jb_cache_paths() {
+    local d
+    while IFS= read -r d; do
+        [[ -d "$H/.cache/JetBrains/$d" ]] && echo "$H/.cache/JetBrains/$d"
+    done < <(jb_latest)
+}
+
+# ── snap ──────────────────────────────────────────────────────────────────────
+# Revisioni disabilitate: snapd tiene le vecchie versioni dopo ogni aggiornamento.
+snap_disabled() {
+    command -v snap >/dev/null || return 0
+    snap list --all 2>/dev/null | awk 'NR > 1 && $NF ~ /disabled/ {print $1, $3}'
+}
+
+# ── categorie ─────────────────────────────────────────────────────────────────
+# Ogni categoria ha: etichetta, icona, livello (1 = consigliata, 2 = opzionale),
+# se serve sudo, una descrizione, e le funzioni size_<id> / list_<id> / run_<id>.
+# SKIP[<id>] (se non vuota) spiega perche' la categoria e' saltata.
+
+CATS=(npm pip thumbs claudever claudedl ccache vscode headless
+      snap apt autoremove rcpkgs journal oldlogs crash
+      jbcache browsers chrome chromium nextbuild hyprbuild claudejobs chromiumsnap
+      jbold trash cliphist)
+
+declare -A LABEL ICON TIER SUDO DESC SIZE SKIP
+
+LABEL[npm]="Cache npm e npx";            TIER[npm]=1; SUDO[npm]=0; ICON[npm]=$''
+DESC[npm]="pacchetti scaricati, npm/npx li riscaricano quando servono"
+size_npm() { size_of "$H/.npm/_cacache" "$H/.npm/_npx" "$H/.npm/_logs"; }
+list_npm() { printf '%s\n' "$H/.npm/_cacache" "$H/.npm/_npx" "$H/.npm/_logs"; }
+run_npm() {
+    rm -rf -- "$H/.npm/_cacache" "$H/.npm/_logs"
+    # _npx contiene anche i pacchetti dei server MCP avviati con npx: se uno e'
+    # in esecuzione non lo si tocca.
+    if running "$H/.npm/_npx"; then
+        note "_npx in uso da un processo: lasciata intatta"
+    else
+        rm -rf -- "$H/.npm/_npx"
+    fi
+}
+
+LABEL[pip]="Cache pip";                  TIER[pip]=1; SUDO[pip]=0; ICON[pip]=$''
+DESC[pip]="wheel scaricate da pip"
+size_pip() { size_of "$H/.cache/pip"; }
+list_pip() { echo "$H/.cache/pip"; }
+run_pip() { empty_dir "$H/.cache/pip"; }
+
+LABEL[thumbs]="Miniature";               TIER[thumbs]=1; SUDO[thumbs]=0; ICON[thumbs]=$''
+DESC[thumbs]="anteprime delle immagini, rigenerate al bisogno"
+size_thumbs() { size_of "$H/.cache/thumbnails"; }
+list_thumbs() { echo "$H/.cache/thumbnails"; }
+run_thumbs() { empty_dir "$H/.cache/thumbnails"; }
+
+LABEL[claudever]="Versioni vecchie di Claude Code"; TIER[claudever]=1; SUDO[claudever]=0; ICON[claudever]=$''
+DESC[claudever]="binari lasciati dagli aggiornamenti (restano l'attuale e quelle in uso)"
+# La versione attiva e' quella puntata da ~/.local/bin/claude; si salvano anche
+# quelle che una sessione aperta sta ancora eseguendo.
+claudever_paths() {
+    local cur used f
+    cur=$(readlink -f "$H/.local/bin/claude" 2>/dev/null)
+    [[ -n $cur ]] || return 0
+    used=$(for f in /proc/[0-9]*/exe; do readlink "$f"; done 2>/dev/null | sort -u)
+    for f in "$H/.local/share/claude/versions"/*; do
+        [[ -f $f && $f != "$cur" ]] || continue
+        grep -qxF -- "$f" <<<"$used" && continue
+        echo "$f"
+    done
+}
+size_claudever() { local p; mapfile -t p < <(claudever_paths); size_of "${p[@]}"; }
+list_claudever() { claudever_paths; }
+run_claudever() { local f; while IFS= read -r f; do rm -f -- "$f"; done < <(claudever_paths); }
+
+LABEL[claudedl]="Download vecchi di Claude Code"; TIER[claudedl]=1; SUDO[claudedl]=0; ICON[claudedl]=$''
+DESC[claudedl]="installer gia' usati in ~/.claude/downloads (quelli di oggi restano)"
+claudedl_paths() { find "$H/.claude/downloads" -mindepth 1 -maxdepth 1 -mtime +0 2>/dev/null; }
+size_claudedl() { local p; mapfile -t p < <(claudedl_paths); size_of "${p[@]}"; }
+list_claudedl() { claudedl_paths; }
+run_claudedl() { local f; while IFS= read -r f; do rm -rf -- "$f"; done < <(claudedl_paths); }
+
+LABEL[ccache]="Cache di Claude Desktop";  TIER[ccache]=1; SUDO[ccache]=0; ICON[ccache]=$''
+DESC[ccache]="cache web e GPU dell'app (conversazioni e login restano)"
+CCACHE_DIRS=("$H/.config/Claude/Cache" "$H/.config/Claude/Code Cache" "$H/.config/Claude/GPUCache")
+size_ccache() { size_of "${CCACHE_DIRS[@]}"; }
+list_ccache() { printf '%s\n' "${CCACHE_DIRS[@]}"; }
+run_ccache() { local d; for d in "${CCACHE_DIRS[@]}"; do empty_dir "$d"; done; }
+
+LABEL[vscode]="Cache di VS Code";         TIER[vscode]=1; SUDO[vscode]=0; ICON[vscode]=$''
+DESC[vscode]="cache web, dati compilati e pacchetti delle estensioni gia' installate"
+VSCODE_DIRS=("$H/.config/Code/Cache" "$H/.config/Code/CachedData" "$H/.config/Code/CachedExtensionVSIXs")
+size_vscode() { size_of "${VSCODE_DIRS[@]}"; }
+list_vscode() { printf '%s\n' "${VSCODE_DIRS[@]}"; }
+run_vscode() { local d; for d in "${VSCODE_DIRS[@]}"; do empty_dir "$d"; done; }
+
+LABEL[headless]="Profili temporanei di Chrome headless"; TIER[headless]=1; SUDO[headless]=0; ICON[headless]=$''
+DESC[headless]="cartelle scoped_dir lasciate dalle sessioni headless"
+size_headless() { size_of "$H/.cache/google-chrome-headless"; }
+list_headless() { echo "$H/.cache/google-chrome-headless"; }
+run_headless() { empty_dir "$H/.cache/google-chrome-headless"; }
+
+LABEL[snap]="Revisioni snap disabilitate"; TIER[snap]=1; SUDO[snap]=1; ICON[snap]=$''
+DESC[snap]="vecchie versioni degli snap: dopo non si puo' piu' fare snap revert"
+size_snap() {
+    local name rev total=0 f
+    while read -r name rev; do
+        [[ -n "$name" ]] || continue
+        f="/var/lib/snapd/snaps/${name}_${rev}.snap"
+        [[ -f "$f" ]] && total=$((total + $(stat -c %s -- "$f")))
+    done < <(snap_disabled)
+    echo "$total"
+}
+list_snap() { snap_disabled | awk '{print $1 "@" $2}' | paste -sd' ' | fold -s -w $(( IW - 8 )); }
+run_snap() {
+    local name rev
+    while read -r name rev; do
+        [[ -n "$name" ]] || continue
+        sudo snap remove "$name" --revision="$rev"
+    done < <(snap_disabled)
+}
+
+LABEL[apt]="Cache apt";                  TIER[apt]=1; SUDO[apt]=1; ICON[apt]=$''
+DESC[apt]="pacchetti .deb gia' installati (apt-get clean)"
+size_apt() { size_of /var/cache/apt/archives /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin; }
+list_apt() { echo "/var/cache/apt  → sudo apt-get clean"; }
+run_apt() { sudo apt-get clean; }
+
+LABEL[autoremove]="Pacchetti apt orfani"; TIER[autoremove]=1; SUDO[autoremove]=1; ICON[autoremove]=$''
+DESC[autoremove]="dipendenze non piu' richieste da nessun pacchetto"
+# I kernel vecchi restano: apt li segna rimovibili dopo ogni aggiornamento del
+# kernel, ma quello precedente e' il fallback voluto da Ubuntu.
+autoremove_pkgs() {
+    apt-get -s autoremove 2>/dev/null | awk '/^Remv/ {print $2}' | grep -vE '^linux-'
+}
+size_autoremove() {
+    local pkgs kb
+    pkgs=$(autoremove_pkgs)
+    [[ -n "$pkgs" ]] || { echo 0; return; }
+    # shellcheck disable=SC2086
+    kb=$(dpkg-query -W -f='${Installed-Size}\n' $pkgs 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    echo $((kb * 1024))
+}
+list_autoremove() { autoremove_pkgs; }
+# shellcheck disable=SC2046
+run_autoremove() { sudo apt-get -y remove --autoremove $(autoremove_pkgs); }
+
+LABEL[rcpkgs]="Residui di pacchetti rimossi"; TIER[rcpkgs]=1; SUDO[rcpkgs]=1; ICON[rcpkgs]=$''
+DESC[rcpkgs]="configurazioni di pacchetti gia' disinstallati e moduli di kernel vecchi"
+rc_pkgs() { dpkg -l 2>/dev/null | awk '$1 == "rc" {print $2}'; }
+# Cartelle in /lib/modules di kernel non piu' installati (mai quella in uso).
+orphan_modules() {
+    local d v
+    for d in /lib/modules/*/; do
+        v=$(basename "$d")
+        [[ $v =~ ^[0-9] && $v != "$(uname -r)" ]] || continue
+        dpkg -l "linux-modules-$v" "linux-image-$v" 2>/dev/null | grep -q '^ii' && continue
+        echo "/lib/modules/$v"
+    done
+}
+# I file di configurazione non si misurano: si stimano 4K per pacchetto.
+size_rcpkgs() {
+    local p n
+    mapfile -t p < <(orphan_modules)
+    n=$(rc_pkgs | wc -l)
+    echo $(( $(size_of "${p[@]}") + n * 4096 ))
+}
+list_rcpkgs() {
+    local n
+    n=$(rc_pkgs | wc -l)
+    (( n )) && echo "$n pacchetti da purgare (dpkg --purge)"
+    orphan_modules
+}
+run_rcpkgs() {
+    local d pkgs
+    mapfile -t pkgs < <(rc_pkgs)
+    (( ${#pkgs[@]} )) && sudo dpkg --purge "${pkgs[@]}"
+    while IFS= read -r d; do sudo rm -rf -- "$d"; done < <(orphan_modules)
+}
+
+LABEL[journal]="Journal di systemd";     TIER[journal]=1; SUDO[journal]=1; ICON[journal]=$''
+DESC[journal]="log di sistema, ridotti a $JOURNAL_KEEP (i piu' recenti restano)"
+size_journal() {
+    local used keep
+    used=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]?B?' | head -1)
+    used=$(numfmt --from=iec "${used%B}" 2>/dev/null || echo 0)
+    keep=$(numfmt --from=iec "$JOURNAL_KEEP")
+    (( used > keep )) && echo $((used - keep)) || echo 0
+}
+list_journal() { echo "sudo journalctl --vacuum-size=$JOURNAL_KEEP"; }
+run_journal() { sudo journalctl --vacuum-size="$JOURNAL_KEEP"; }
+
+LABEL[oldlogs]="Log ruotati";            TIER[oldlogs]=1; SUDO[oldlogs]=1; ICON[oldlogs]=$''
+DESC[oldlogs]="vecchi log compressi o numerati in /var/log"
+oldlogs_find() {
+    find /var/log -type f \( -name '*.gz' -o -name '*.[0-9]' -o -name '*.old' \) "$@" 2>/dev/null
+}
+size_oldlogs() { oldlogs_find -printf '%s\n' | awk '{s+=$1} END {print s+0}'; }
+list_oldlogs() { oldlogs_find; }
+# Cancella esattamente i file mostrati in anteprima (cercati senza sudo), non
+# quelli che un find con sudo troverebbe anche nelle cartelle riservate a root.
+# find esce con 1 sulle cartelle non leggibili: non e' un errore della pulizia.
+run_oldlogs() { { oldlogs_find -print0 || true; } | sudo xargs -0 -r rm -f --; }
+
+LABEL[crash]="Crash report";             TIER[crash]=1; SUDO[crash]=1; ICON[crash]=$''
+DESC[crash]="dump di programmi andati in crash"
+size_crash() { size_of /var/crash/*; }
+list_crash() { find /var/crash -mindepth 1 -maxdepth 1 2>/dev/null; }
+run_crash() { sudo find /var/crash -mindepth 1 -delete; }
+
+LABEL[jbcache]="Cache dell'IDE JetBrains in uso"; TIER[jbcache]=2; SUDO[jbcache]=0; ICON[jbcache]=$''
+DESC[jbcache]="indici e cache: al prossimo avvio l'IDE reindicizza tutto (lento)"
+size_jbcache() { local p; mapfile -t p < <(jb_cache_paths); size_of "${p[@]}"; }
+list_jbcache() { jb_cache_paths; }
+run_jbcache() { local d; while IFS= read -r d; do empty_dir "$d"; done < <(jb_cache_paths); }
+
+LABEL[browsers]="Browser di Playwright e Puppeteer"; TIER[browsers]=2; SUDO[browsers]=0; ICON[browsers]=$''
+DESC[browsers]="test e automazioni si fermano finche' non li riscarichi (npx playwright install)"
+size_browsers() { size_of "$H/.cache/ms-playwright" "$H/.cache/puppeteer"; }
+list_browsers() { printf '%s\n' "$H/.cache/ms-playwright" "$H/.cache/puppeteer"; }
+run_browsers() { empty_dir "$H/.cache/ms-playwright"; empty_dir "$H/.cache/puppeteer"; }
+
+LABEL[chrome]="Cache di Google Chrome";   TIER[chrome]=2; SUDO[chrome]=0; ICON[chrome]=$''
+DESC[chrome]="cache web su disco (profilo, login e cronologia restano)"
+size_chrome() { size_of "$H/.cache/google-chrome"; }
+list_chrome() { echo "$H/.cache/google-chrome"; }
+run_chrome() { empty_dir "$H/.cache/google-chrome"; }
+
+LABEL[chromium]="Cache di Chromium (snap)"; TIER[chromium]=2; SUDO[chromium]=0; ICON[chromium]=$''
+DESC[chromium]="cache web su disco (profilo, login e cronologia restano)"
+chromium_dirs() {
+    local d
+    for d in "$H/snap/chromium/common/chromium"/{Default,Profile\ *}/{Cache,Code\ Cache} \
+             "$H/snap/chromium/common/.cache"; do
+        [[ -d $d ]] && echo "$d"
+    done
+}
+size_chromium() { local p; mapfile -t p < <(chromium_dirs); size_of "${p[@]}"; }
+list_chromium() { chromium_dirs; }
+run_chromium() { local d; while IFS= read -r d; do empty_dir "$d"; done < <(chromium_dirs); }
+
+LABEL[nextbuild]="Build di Next.js nei progetti"; TIER[nextbuild]=2; SUDO[nextbuild]=0; ICON[nextbuild]=$''
+DESC[nextbuild]="cartelle .next sotto ~/git: il prossimo next dev o build riparte da zero"
+next_dirs() {
+    find "$H/git" -maxdepth 4 \( -name node_modules -prune \) -o \
+        \( -type d -name .next -print -prune \) 2>/dev/null
+}
+size_nextbuild() { local p; mapfile -t p < <(next_dirs); size_of "${p[@]}"; }
+list_nextbuild() { next_dirs; }
+run_nextbuild() { local d; while IFS= read -r d; do rm -rf -- "$d"; done < <(next_dirs); }
+
+LABEL[hyprbuild]="Sorgenti compilati di Hyprland"; TIER[hyprbuild]=2; SUDO[hyprbuild]=0; ICON[hyprbuild]=$''
+DESC[hyprbuild]="alberi scompattati in ~/src/hypr/w: build.sh li riscarica; .deb e tarball restano"
+# build.sh fa rm -rf + apt-get source a ogni compilazione, quindi le cartelle
+# scompattate si rigenerano; i .deb, i .dsc e i tarball servono a reinstallare.
+hyprbuild_dirs() { find "$H/src/hypr/w" -mindepth 2 -maxdepth 2 -type d 2>/dev/null; }
+size_hyprbuild() { local p; mapfile -t p < <(hyprbuild_dirs); size_of "${p[@]}"; }
+list_hyprbuild() { hyprbuild_dirs; }
+run_hyprbuild() { local d; while IFS= read -r d; do rm -rf -- "$d"; done < <(hyprbuild_dirs); }
+
+LABEL[claudejobs]="File temporanei dei job di Claude"; TIER[claudejobs]=2; SUDO[claudejobs]=0; ICON[claudejobs]=$''
+DESC[claudejobs]="tmp dei job conclusi da almeno un giorno (stato e cronologia restano)"
+# Solo job in uno stato finale, non fissati in pins.json e fermi da piu' di un giorno.
+claudejobs_dirs() {
+    local j id st pins
+    pins=$(cat "$H/.claude/jobs/pins.json" 2>/dev/null)
+    for j in "$H/.claude/jobs"/*/; do
+        j=${j%/}; id=$(basename "$j")
+        [[ -d $j/tmp && -f $j/state.json ]] || continue
+        [[ $pins == *"\"$id\""* ]] && continue
+        st=$(grep -m1 -oE '"state": *"[a-z]+"' "$j/state.json" | grep -oE '[a-z]+"$' | tr -d '"')
+        [[ $st =~ ^(done|failed|error|cancell?ed|stopped)$ ]] || continue
+        [[ -n $(find "$j/state.json" -mtime +0) ]] || continue
+        echo "$j/tmp"
+    done
+}
+size_claudejobs() { local p; mapfile -t p < <(claudejobs_dirs); size_of "${p[@]}"; }
+list_claudejobs() { claudejobs_dirs; }
+run_claudejobs() { local d; while IFS= read -r d; do empty_dir "$d"; done < <(claudejobs_dirs); }
+
+LABEL[chromiumsnap]="Disinstalla Chromium (snap)"; TIER[chromiumsnap]=2; SUDO[chromiumsnap]=1; ICON[chromiumsnap]=$''
+DESC[chromiumsnap]="snap remove --purge: via anche profilo, segnalibri e password di Chromium"
+chromiumsnap_files() {
+    command -v snap >/dev/null && snap list chromium >/dev/null 2>&1 || return 0
+    echo "$H/snap/chromium"
+    ls /var/lib/snapd/snaps/chromium_*.snap 2>/dev/null
+}
+size_chromiumsnap() { local p; mapfile -t p < <(chromiumsnap_files); size_of "${p[@]}"; }
+# Quanti dati personali ha il profilo: e' quello che si perde disinstallando.
+chromium_profile_summary() {
+    local p="$H/snap/chromium/common/chromium/Default" bm=0 pw="?" ext=0
+    [[ -d $p ]] || return 0
+    [[ -f $p/Bookmarks ]] && bm=$(grep -c '"type": "url"' "$p/Bookmarks")
+    [[ -d $p/Extensions ]] && ext=$(find "$p/Extensions" -mindepth 1 -maxdepth 1 -type d | wc -l)
+    if [[ -f "$p/Login Data" ]] && command -v python3 >/dev/null; then
+        # Il database e' bloccato mentre Chromium e' aperto: se ne legge una copia.
+        pw=$(python3 - "$p/Login Data" "$TMPD/logins" 2>/dev/null <<'PY'
+import shutil, sqlite3, sys
+shutil.copy(sys.argv[1], sys.argv[2])
+print(sqlite3.connect(sys.argv[2]).execute("select count(*) from logins").fetchone()[0])
+PY
+) || pw="?"
+    fi
+    echo "profilo: $bm segnalibri, ${pw:-?} password salvate, $ext estensioni"
+}
+list_chromiumsnap() { chromium_profile_summary; chromiumsnap_files; }
+run_chromiumsnap() { sudo snap remove --purge chromium; }
+
+LABEL[jbold]="Versioni JetBrains vecchie"; TIER[jbold]=2; SUDO[jbold]=0; ICON[jbold]=$''
+DESC[jbold]="impostazioni, cache e dati delle versioni IDE non piu' in uso"
+size_jbold() { local p; mapfile -t p < <(jb_old_paths); size_of "${p[@]}"; }
+list_jbold() { jb_old_paths; }
+run_jbold() { local d; while IFS= read -r d; do rm -rf -- "$d"; done < <(jb_old_paths); }
+
+LABEL[trash]="Cestino";                  TIER[trash]=2; SUDO[trash]=0; ICON[trash]=$''
+DESC[trash]="file cestinati: non si recuperano piu'"
+size_trash() { size_of "$H/.local/share/Trash/files" "$H/.local/share/Trash/info"; }
+# Si elencano i file cestinati, piu' recenti prima: e' l'ultima occasione per recuperarli.
+list_trash() { ls -At "$H/.local/share/Trash/files" 2>/dev/null; }
+run_trash() { empty_dir "$H/.local/share/Trash/files"; empty_dir "$H/.local/share/Trash/info"; }
+
+LABEL[cliphist]="Cronologia appunti";    TIER[cliphist]=2; SUDO[cliphist]=0; ICON[cliphist]=$''
+DESC[cliphist]="tutto lo storico di cliphist, non si recupera piu'"
+size_cliphist() { command -v cliphist >/dev/null && size_of "$H/.cache/cliphist" || echo 0; }
+list_cliphist() { echo "$H/.cache/cliphist  → cliphist wipe"; }
+run_cliphist() { cliphist wipe; }
+
+# Programmi in esecuzione che rendono rischioso toccare una categoria.
+check_skips() {
+    local c
+    for c in "${CATS[@]}"; do SKIP[$c]=""; done
+    pgrep -x chrome >/dev/null 2>&1 && SKIP[chrome]="Chrome e' aperto: chiudilo prima"
+    running "$H/.local/share/JetBrains/Toolbox/apps" || running 'com.intellij' \
+        && SKIP[jbcache]="l'IDE JetBrains e' aperto: chiudilo prima"
+    running "ms-playwright|puppeteer" && SKIP[browsers]="un browser di test e' in esecuzione"
+    running 'claude-desktop' && SKIP[ccache]="Claude Desktop e' aperto: chiudilo prima"
+    running '/usr/share/code/' && SKIP[vscode]="VS Code e' aperto: chiudilo prima"
+    running 'google-chrome-headless|--headless' && SKIP[headless]="Chrome headless e' in esecuzione"
+    running '/snap/chromium/' && SKIP[chromium]="Chromium e' aperto: chiudilo prima"
+    SKIP[chromiumsnap]=${SKIP[chromium]}
+    running 'next dev|next start|next build|next-server' \
+        && SKIP[nextbuild]="un server Next.js e' in esecuzione"
+}
+
+# ── intestazione ──────────────────────────────────────────────────────────────
+OS_NAME=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}")
+KERNEL=$(uname -r)
+HOST=$(hostname -s 2>/dev/null || uname -n)
+read -r DISK_SIZE DISK_AVAIL < <(df -h --output=size,avail / | tail -1)
+DISK_PCT0=$(disk_pct)
+MODE_TXT="interattivo"; $PREVIEW_ONLY && MODE_TXT="solo anteprima"
+
+ikv() {  # $1 etichetta, $2 valore plain, $3 larghezza → _kv
+    trunc "$2" $(( $3 - 8 ))
+    rpad "$1" 8; _kv="${C_MUT}${_r}${C_TXT}${_t}${RST}"
+}
+
+# Colonna di informazioni a destra del banner, 6 righe → INFO[]
+build_info() {  # $1 larghezza
+    local sw=$1 u="${USER:-user}@${HOST}"
+    INFO=()
+    trunc "$u" "$sw"
+    INFO+=("${C_PNK}${BLD}${USER:-user}${NOB}${C_MUT}@${C_CYN}${BLD}${HOST}${RST}")
+    hr $(( ${#u} < sw ? ${#u} : sw )); INFO+=("${C_BRD}${_hr}${RST}")
+    ikv os "$OS_NAME" "$sw";  INFO+=("$_kv")
+    ikv kernel "$KERNEL" "$sw"; INFO+=("$_kv")
+    meter "$DISK_PCT0" 12
+    INFO+=("${C_MUT}disco${RST}   ${_m} ${C_TXT}${DISK_PCT0}%${RST}")
+    ikv libero "$DISK_AVAIL di $DISK_SIZE" "$sw"; INFO+=("$_kv")
+}
+
+banner_frame() {  # $1 fase del gradiente, $2 larghezza colonna info (0 = niente)
+    local phase=$1 sw=$2 r c ch idx out line
+    for (( r=0; r<6; r++ )); do
+        line=${BANNER[r]}; out=""
+        for (( c=0; c<${#line}; c++ )); do
+            ch=${line:c:1}
+            if [[ $ch == ' ' ]]; then out+=' '; continue; fi
+            idx=$(( (c + r * 2 - phase + 480) % 48 ))
+            if [[ $ch == '█' ]]; then out+="${GRAD[idx]}$ch"; else out+="${GRAD_DIM[idx]}$ch"; fi
+        done
+        (( sw > 0 )) && out+="${RST}    ${INFO[r]}"
+        (( TTY )) && printf '\033[2K'
+        printf '  %s%s\n' "$out" "$RST"
+    done
+}
+
+draw_header() {
+    local sw=0 f
+    echo
+    if (( COLS < BANNER_W + 4 )); then
+        printf '  %s%svmclean%s %s▸ pulizia della VM · %s%s\n\n' \
+            "${GRAD[0]}" "$BLD" "$RST" "$C_MUT" "$MODE_TXT" "$RST"
+        return
+    fi
+    (( COLS >= BANNER_W + 2 + 4 + 28 )) && sw=$(( COLS - BANNER_W - 2 - 4 - 1 ))
+    (( sw > 40 )) && sw=40
+    (( sw > 0 )) && build_info "$sw"
+    banner_frame 0 "$sw"
+    # Breve passata del gradiente sul banner, come l'animazione di cla2.
+    if (( ANIM && COLOR )); then
+        for (( f=3; f<=48; f+=3 )); do
+            printf '\033[6A'; banner_frame "$f" "$sw"; sleep 0.02
+        done
+    fi
+    printf '  %spulizia della VM %s·%s anteprima prima di cancellare %s·%s %s%s\n' \
+        "$C_MUT" "$C_BRD" "$C_MUT" "$C_BRD" "$C_MUT" "$MODE_TXT" "$RST"
+    if (( sw == 0 )); then
+        meter "$DISK_PCT0" 12
+        printf '  %s%s%s %s %s%s%% · %s liberi di %s%s\n' "$C_MUT" "$G_DISK" "$RST" "$_m" \
+            "$C_TXT" "$DISK_PCT0" "$DISK_AVAIL" "$DISK_SIZE" "$RST"
+    fi
+    echo
+}
+
+# ── scansione (log in stile dmesg, come il boot di cla2) ─────────────────────
+scan() {
+    local t0 c n=0 e st busy=0 lab
+    t0=${EPOCHREALTIME//[.,]/}
+    blog() {
+        (( TTY )) || return 0
+        e=$(( ${EPOCHREALTIME//[.,]/} - t0 ))
+        printf '  %s[%3d.%06d]%s %s\n' "$C_MUT" $(( e / 1000000 )) $(( e % 1000000 )) "$RST" "$1"
+        n=$(( n + 1 ))
+        (( ANIM )) && sleep 0.015
+    }
+    blog "${C_PUR}${BLD}vmclean${RST}: scan di ${#CATS[@]} categorie ${C_MUT}· $(id -un) · senza sudo${RST}"
+    check_skips
+    for c in "${CATS[@]}"; do
+        SIZE[$c]=$("size_$c")
+        rpad "${LABEL[$c]}" 38; lab=$_r
+        if (( SIZE[$c] == 0 )); then
+            st="${C_MUT}[ -- ] ${ICON[$c]} ${lab} vuota${RST}"
+        elif [[ -n ${SKIP[$c]} ]]; then
+            st="${C_YLW}[SKIP]${RST} ${ICON[$c]} ${lab} ${C_YLW}${SKIP[$c]}${RST}"
+        else
+            st="${C_GRN}[ OK ]${RST} ${ICON[$c]} ${C_TXT}${lab}${RST} ${C_CYN}$(human "${SIZE[$c]}")${RST}"
+            busy=$(( busy + 1 ))
+        fi
+        blog "$st"
+    done
+    e=$(( ${EPOCHREALTIME//[.,]/} - t0 ))
+    blog "${C_GRN}${BLD}ready${RST}. ${busy} categorie con spazio da liberare${C_PNK}▌${RST}"
+    (( ANIM )) && sleep 0.3
+    # Il log sparisce e resta solo il riepilogo: l'anteprima e' piu' sotto.
+    (( TTY )) && printf '\033[%dA\033[J' "$n"
+    printf '  %s%s%s scan completata in %d.%02ds %s·%s %d categorie %s·%s %d con qualcosa da liberare%s\n\n' \
+        "$C_GRN" "$G_OK" "$C_MUT" $(( e / 1000000 )) $(( e % 1000000 / 10000 )) \
+        "$C_BRD" "$C_MUT" "${#CATS[@]}" "$C_BRD" "$C_MUT" "$busy" "$RST"
+}
+
+# ── anteprima ────────────────────────────────────────────────────────────────
+
+# Categorie selezionabili, nell'ordine (e con il numero) in cui compaiono.
+AVAIL=()
+
+cat_row() {  # $1 numero ("" se saltata), $2 categoria, $3 massimo, $4 colore
+    local c=$2 col=$4 num lw size lock bar out
+    local barseg=$(( BARW > 0 ? BARW + 2 : 0 ))
+    lw=$(( IW - 15 - barseg ))
+    printf -v num '%2s' "$1"
+    trunc "${LABEL[$c]}" "$lw"; rpad "$_t" "$lw"
+    lpad "$(human "${SIZE[$c]}")" 7; size=$_l
+    lock=" "; (( SUDO[$c] )) && lock="${C_YLW}${G_LOCK}${RST}"
+    if [[ -n $1 ]]; then
+        bar=""; (( BARW )) && { gbar "${SIZE[$c]}" "$3" "$BARW"; bar="${_b}  "; }
+        out="${col}${BLD}${num}${RST} ${col}${ICON[$c]}${RST} ${C_TXT}${BLD}${_r}${RST} ${bar}${C_CYN}${BLD}${size}${RST} ${lock}"
+    else
+        spaces "$barseg"; bar=$_s
+        out="${C_MUT}${num} ${G_BAN} ${_r} ${bar}${size}${RST} ${lock}"
+    fi
+    box_line "$out" "$IW"
+}
+
+# Riga di dettaglio sotto una categoria: $1 ramo (├ └ o vuoto), $2 testo, $3 colore
+det_line() {
+    if [[ -z $1 ]]; then
+        trunc "$2" $(( IW - 5 )); box_line "     $3${_t}${RST}" $(( 5 + ${#_t} ))
+    else
+        trunc "$2" $(( IW - 7 )); box_line "     ${C_BRD}$1${RST} $3${_t}${RST}" $(( 7 + ${#_t} ))
+    fi
+}
+
+cat_block() {  # $1 numero ("" se saltata), $2 categoria, $3 massimo, $4 colore
+    local c=$2 items=() k shown more br
+    cat_row "$1" "$c" "$3" "$4"
+    if [[ -n ${SKIP[$c]} ]]; then
+        det_line "" "${G_WARN} saltata: ${SKIP[$c]}" "$C_YLW"
+        return
+    fi
+    det_line "" "${DESC[$c]}" "$C_MUT"
+    mapfile -t items < <("list_$c")
+    shown=${#items[@]}; more=0
+    (( shown > 5 )) && { more=$(( shown - 4 )); shown=4; }
+    for (( k=0; k<shown; k++ )); do
+        br="├"; (( k == shown - 1 && more == 0 )) && br="└"
+        det_line "$br" "${items[k]/#$H/\~}" "$C_TXT"
+    done
+    (( more )) && det_line "└" "… e altri $more" "$C_MUT"
+}
+
+preview() {
+    local c t i=0 total=0 total1=0 max=0 first title col
+    for c in "${CATS[@]}"; do
+        (( SIZE[$c] > max )) && max=${SIZE[$c]}
+    done
+    for t in 1 2; do
+        first=1
+        for c in "${CATS[@]}"; do
+            (( TIER[$c] == t && SIZE[$c] > 0 )) || continue
+            if (( first )); then
+                if (( t == 1 )); then
+                    title="${G_SHIELD} CONSIGLIATE · si rigenerano da sole"; col=$C_GRN
+                else
+                    title="${G_WARN} OPZIONALI · hanno un costo, leggi la nota"; col=$C_YLW
+                fi
+                box_top "$title" "$col"
+                first=0
+            else
+                box_line "" 0
+            fi
+            if [[ -n ${SKIP[$c]} ]]; then
+                cat_block "" "$c" "$max" "$col"
+                continue
+            fi
+            i=$(( i + 1 ))
+            AVAIL+=("$c")
+            total=$(( total + SIZE[$c] ))
+            (( t == 1 )) && total1=$(( total1 + SIZE[$c] ))
+            cat_block "$i" "$c" "$max" "$col"
+        done
+        (( first )) || { box_bot; echo; }
+    done
+
+    if (( ${#AVAIL[@]} == 0 )); then
+        printf '  %s%s%s niente da pulire, la VM e'"'"' gia'"'"' in ordine.%s\n\n' "$C_GRN" "$G_OK" "$C_TXT" "$RST"
+        return 1
+    fi
+    total=$(( total - $(chromium_overlap AVAIL) ))
+    pl_seg " ${G_RECYCLE} VMCLEAN " "$R_PNK" "$R_DRK"
+    pl_seg " ${#AVAIL[@]} categorie " "$R_SEG" "$R_TXT"
+    pl_seg " ${G_SHIELD} consigliate $(human "$total1") " "$R_GRN" "$R_DRK"
+    pl_seg " tutte $(human "$total") " "$R_YLW" "$R_DRK"
+    (( COLS >= 90 )) && pl_seg " ${G_DISK} / ${DISK_PCT0}% · ${DISK_AVAIL} liberi " "$R_SEG" "$R_TXT"
+    pl_end
+    printf '  %s%s non toccati: sessioni e config di ~/.claude, la versione attiva di Claude Code,%s\n' \
+        "$C_MUT" "$G_LOCK" "$RST"
+    printf '  %s  node_modules dei progetti, kernel installati. %s%s%s = serve sudo%s\n' \
+        "$C_MUT" "$C_YLW" "$G_LOCK" "$C_MUT" "$RST"
+    return 0
+}
+
+# ── selezione ─────────────────────────────────────────────────────────────────
+
+# Byte contati due volte se, nella lista $1 (nome di array), c'e' sia la
+# disinstallazione di Chromium sia la sua cache o le revisioni snap vecchie.
+chromium_overlap() {
+    local -n _list=$1
+    local over=0 f
+    [[ " ${_list[*]} " == *" chromiumsnap "* ]] || { echo 0; return; }
+    [[ " ${_list[*]} " == *" chromium "* ]] && over=$(( over + SIZE[chromium] ))
+    if [[ " ${_list[*]} " == *" snap "* ]]; then
+        while read -r name rev; do
+            f="/var/lib/snapd/snaps/chromium_${rev}.snap"
+            [[ $name == chromium && -f $f ]] && over=$(( over + $(stat -c %s -- "$f") ))
+        done < <(snap_disabled)
+    fi
+    echo "$over"
+}
+
+# La disinstallazione di Chromium comprende gia' la pulizia della sua cache.
+dedupe_chosen() {
+    local c out=()
+    [[ " ${CHOSEN[*]} " == *" chromiumsnap "* ]] || return 0
+    for c in "${CHOSEN[@]}"; do [[ $c == chromium ]] || out+=("$c"); done
+    CHOSEN=("${out[@]}")
+}
+
+select_cats() {
+    local answer n c bad
+    while true; do
+        CHOSEN=()
+        echo
+        printf '  '; hint c consigliate; hint t tutte; hint "1-${#AVAIL[@]}" "scegli (es. 1 3 5)"
+        hint "⏎" niente; printf '%s\n' "$RST"
+        read -rp "  ${C_PNK}${G_SEP_R}${RST} " answer || return 1
+        bad=""
+        case "$answer" in
+            ""|q|Q) return 1 ;;
+            c|C) for c in "${AVAIL[@]}"; do (( TIER[$c] == 1 )) && CHOSEN+=("$c"); done ;;
+            t|T) CHOSEN=("${AVAIL[@]}") ;;
+            *)
+                for n in ${answer//,/ }; do
+                    if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#AVAIL[@]} )); then
+                        c="${AVAIL[n-1]}"
+                        [[ " ${CHOSEN[*]} " == *" $c "* ]] || CHOSEN+=("$c")
+                    else
+                        bad=$n; break
+                    fi
+                done
+                ;;
+        esac
+        if [[ -n $bad ]]; then
+            printf '  %s%s scelta non valida: %s%s\n' "$C_RED" "$G_WARN" "$bad" "$RST"
+        elif (( ${#CHOSEN[@]} == 0 )); then
+            printf '  %s%s nessuna categoria consigliata disponibile%s\n' "$C_YLW" "$G_WARN" "$RST"
+        else
+            dedupe_chosen
+            return 0
+        fi
+    done
+}
+
+confirm() {
+    local c total=0 need_sudo=0 answer lw size lock
+    echo
+    box_top "${G_WARN} DA ELIMINARE" "$C_PNK"
+    lw=$(( IW - 13 ))
+    for c in "${CHOSEN[@]}"; do
+        trunc "${LABEL[$c]}" "$lw"; rpad "$_t" "$lw"
+        lpad "$(human "${SIZE[$c]}")" 7; size=$_l
+        lock=" "; (( SUDO[$c] )) && { lock="${C_YLW}${G_LOCK}${RST}"; need_sudo=1; }
+        box_line " ${C_PNK}${ICON[$c]}${RST} ${C_TXT}${_r}${RST} ${C_CYN}${size}${RST} ${lock}" "$IW"
+        total=$(( total + SIZE[$c] ))
+    done
+    total=$(( total - $(chromium_overlap CHOSEN) ))
+    hr "$IW"; box_line "${C_BRD}${_hr}${RST}" "$IW"
+    rpad "totale stimato" "$lw"; lpad "$(human "$total")" 7
+    box_line "   ${C_TXT}${BLD}${_r}${NOB} ${C_CYN}${BLD}${_l}${RST}  " "$IW"
+    box_bot
+    (( need_sudo )) && printf '  %s%s alcune categorie usano sudo: la password viene chiesta ora%s\n' \
+        "$C_YLW" "$G_LOCK" "$RST"
+    echo
+    read -rp "  ${C_PNK}${BLD}Confermi?${RST} ${C_MUT}[s/N]${RST} " answer || return 1
+    [[ "$answer" == [sS] ]] || return 1
+    if (( need_sudo )); then
+        sudo -v -p "  ${G_LOCK} password di sudo per %u: " \
+            || { printf '  %ssudo non disponibile: annullato.%s\n' "$C_RED" "$RST"; return 1; }
+    fi
+    return 0
+}
+
+# ── esecuzione ────────────────────────────────────────────────────────────────
+
+step() {  # $1 esito (ok|warn|err|skip), $2 etichetta, $3 dettaglio
+    local tag
+    case $1 in
+        ok)   tag="${C_GRN}[ OK ]" ;;
+        warn) tag="${C_YLW}[WARN]" ;;
+        err)  tag="${C_RED}[ERR ]" ;;
+        *)    tag="${C_MUT}[ -- ]" ;;
+    esac
+    rpad "$2" 38
+    printf '  %s%s %s%s%s %s%s\n' "$tag" "$RST" "$C_TXT" "$_r" "$RST" "$3" "$RST"
+}
+
+run_step() {  # $1 categoria
+    local c=$1 log="$TMPD/$1.log" pid st k=0 before freed line
+    local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+    if [[ -n ${SKIP[$c]} ]]; then
+        step skip "${LABEL[$c]}" "${C_YLW}saltata: ${SKIP[$c]}"
+        return
+    fi
+    # Le credenziali di sudo scadono: si rinnovano in primo piano, dove si puo'
+    # chiedere la password, prima di lanciare il passo in background.
+    (( SUDO[$c] )) && ! sudo -n true 2>/dev/null && sudo -v -p "  ${G_LOCK} password di sudo per %u: "
+    before=$(disk_avail)
+    ( "run_$c" ) >"$log" 2>&1 </dev/null &
+    pid=$!
+    if (( TTY )); then
+        printf '\033[?25l'
+        while kill -0 "$pid" 2>/dev/null; do
+            printf '\r  %s%s%s  %s %s%s%s' "$C_CYN" "${frames[k++ % 10]}" "$RST" \
+                "${ICON[$c]}" "$C_TXT" "${LABEL[$c]}" "$RST"
+            sleep 0.08
+        done
+        printf '\r\033[K\033[?25h'
+    fi
+    wait "$pid"; st=$?
+    freed=$(( $(disk_avail) - before )); (( freed < 0 )) && freed=0
+    if (( st != 0 )); then
+        step err "${LABEL[$c]}" "${C_RED}uscita $st"
+        grep -v '^NOTA: ' "$log" | tail -n 3 | while IFS= read -r line; do
+            trunc "$line" $(( COLS - 12 )); printf '         %s%s%s\n' "$C_MUT" "$_t" "$RST"
+        done
+    elif grep -q '^NOTA: ' "$log"; then
+        step warn "${LABEL[$c]}" "${C_CYN}$(human "$freed")"
+    else
+        step ok "${LABEL[$c]}" "${C_CYN}$(human "$freed")"
+    fi
+    grep '^NOTA: ' "$log" | while IFS= read -r line; do
+        printf '         %s%s %s%s\n' "$C_YLW" "$G_WARN" "${line#NOTA: }" "$RST"
+    done
+}
+
+run_all() {
+    local c start after pct1
+    start=$(disk_avail)
+    echo
+    printf '  %s%s%s pulizia in corso%s\n' "${GRAD[0]}" "$BLD" "$G_RECYCLE" "$RST"
+    check_skips   # tra anteprima e conferma puo' essere stato aperto Chrome o l'IDE
+    for c in "${CHOSEN[@]}"; do run_step "$c"; done
+    after=$(disk_avail); pct1=$(disk_pct)
+    echo
+    meter "$DISK_PCT0" 12; local m0=$_m
+    meter "$pct1" 12
+    printf '  %s%s%s disco %s %s%s%%%s  %s→%s  %s %s%s%%%s\n' "$C_MUT" "$G_DISK" "$RST" \
+        "$m0" "$C_TXT" "$DISK_PCT0" "$RST" "$C_PNK" "$RST" "$_m" "$C_TXT" "$pct1" "$RST"
+    pl_seg " ${G_OK} FATTO " "$R_GRN" "$R_DRK"
+    pl_seg " liberati $(human $(( after > start ? after - start : 0 ))) " "$R_PUR" "$R_DRK"
+    pl_seg " ${G_DISK} $(df -h --output=avail / | tail -1 | tr -d ' ') liberi " "$R_SEG" "$R_TXT"
+    pl_end
+    echo
+}
+
+bye() { printf '  %s%s niente da fare, non e'"'"' stato cancellato niente.%s\n\n' "$C_MUT" "$G_OK" "$RST"; }
+
+draw_header
+scan
+preview || exit 0
+echo
+$PREVIEW_ONLY && exit 0
+[[ -t 0 ]] || { printf '  %sinput non interattivo: solo anteprima.%s\n' "$C_MUT" "$RST"; exit 0; }
+select_cats || { echo; bye; exit 0; }
+confirm || { echo; bye; exit 0; }
+run_all
