@@ -8,6 +8,10 @@
 set -uo pipefail
 
 PREVIEW_ONLY=false
+# Oltre questo tempo il calcolo di una categoria si considera bloccato (ad
+# esempio snap list quando snapd o systemd non rispondono) e si salta.
+SCAN_TIMEOUT=${VMCLEAN_TIMEOUT:-20}
+[[ $SCAN_TIMEOUT =~ ^[0-9]+$ && $SCAN_TIMEOUT -gt 0 ]] || SCAN_TIMEOUT=20
 # Dimensione a cui ridurre il journal di systemd.
 JOURNAL_KEEP="200M"
 
@@ -20,6 +24,7 @@ Uso: vmclean [-n|--preview] [-h|--help]
   -h, --help         questo aiuto
 
 VMCLEAN_NOANIM=1 salta le animazioni, NO_COLOR=1 toglie i colori.
+VMCLEAN_TIMEOUT=<secondi> e' il tempo massimo di calcolo per categoria (20).
 EOF
 }
 
@@ -199,6 +204,13 @@ while [[ $_p =~ ^[0-9]+$ ]] && (( _p > 1 )); do
     _st=${_st##*) }; read -r _ _p _ <<<"$_st"
 done
 
+# Termina un processo e tutti i suoi discendenti (prima i figli).
+kill_tree() {
+    local c
+    for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
+    kill "$1" 2>/dev/null
+}
+
 running() {
     local pid cmd a
     for pid in $(pgrep -f -- "$1" 2>/dev/null); do
@@ -271,7 +283,7 @@ CATS=(npm pip thumbs claudever claudedl ccache vscode headless
       jbcache browsers chrome chromium nextbuild hyprbuild claudejobs chromiumsnap
       jbold trash cliphist)
 
-declare -A LABEL ICON TIER SUDO DESC SIZE SKIP
+declare -A LABEL ICON TIER SUDO DESC SIZE SKIP TIMEDOUT
 
 LABEL[npm]="Cache npm e npx";            TIER[npm]=1; SUDO[npm]=0; ICON[npm]=$''
 DESC[npm]="pacchetti scaricati, npm/npx li riscaricano quando servono"
@@ -574,7 +586,10 @@ run_cliphist() { cliphist wipe; }
 # Programmi in esecuzione che rendono rischioso toccare una categoria.
 check_skips() {
     local c
-    for c in "${CATS[@]}"; do SKIP[$c]=""; done
+    for c in "${CATS[@]}"; do
+        SKIP[$c]=""
+        [[ -n ${TIMEDOUT[$c]:-} ]] && SKIP[$c]="non risponde dopo ${SCAN_TIMEOUT}s: riprova piu' tardi"
+    done
     pgrep -x chrome >/dev/null 2>&1 && SKIP[chrome]="Chrome e' aperto: chiudilo prima"
     running "$H/.local/share/JetBrains/Toolbox/apps" || running 'com.intellij' \
         && SKIP[jbcache]="l'IDE JetBrains e' aperto: chiudilo prima"
@@ -672,10 +687,32 @@ scan() {
     }
     blog "${C_PUR}${BLD}vmclean${RST}: scan di ${#CATS[@]} categorie ${C_MUT}· $(id -un) · senza sudo${RST}"
     check_skips
+    local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) pid k start out
     for c in "${CATS[@]}"; do
-        SIZE[$c]=$("size_$c")
         rpad "${LABEL[$c]}" 38; lab=$_r
-        if (( SIZE[$c] == 0 )); then
+        # Il calcolo gira in background: se un comando esterno si blocca, la
+        # categoria si salta invece di bloccare tutto, e intanto si vede quale
+        # categoria si sta calcolando.
+        out="$TMPD/size.$c"
+        ( "size_$c" >"$out" 2>/dev/null ) &
+        pid=$!; k=0; start=$SECONDS
+        while kill -0 "$pid" 2>/dev/null; do
+            if (( SECONDS - start >= SCAN_TIMEOUT )); then
+                kill_tree "$pid"; TIMEDOUT[$c]=1
+                SKIP[$c]="non risponde dopo ${SCAN_TIMEOUT}s: riprova piu' tardi"
+                break
+            fi
+            (( TTY )) && printf '\r\033[K  %s[ %s%s%s  ]%s %s %s%s%s' "$C_MUT" "$C_CYN" \
+                "${frames[k++ % 10]}" "$C_MUT" "$RST" "${ICON[$c]}" "$C_TXT" "${LABEL[$c]}" "$RST"
+            sleep 0.1
+        done
+        wait "$pid" 2>/dev/null
+        (( TTY )) && printf '\r\033[K'
+        SIZE[$c]=$(< "$out") 2>/dev/null
+        [[ ${SIZE[$c]} =~ ^[0-9]+$ ]] || SIZE[$c]=0
+        if [[ -n ${TIMEDOUT[$c]:-} ]]; then
+            st="${C_RED}[TIME]${RST} ${ICON[$c]} ${lab} ${C_RED}non risponde dopo ${SCAN_TIMEOUT}s${RST}"
+        elif (( SIZE[$c] == 0 )); then
             st="${C_MUT}[ -- ] ${ICON[$c]} ${lab} vuota${RST}"
         elif [[ -n ${SKIP[$c]} ]]; then
             st="${C_YLW}[SKIP]${RST} ${ICON[$c]} ${lab} ${C_YLW}${SKIP[$c]}${RST}"
@@ -706,7 +743,8 @@ cat_row() {  # $1 numero ("" se saltata), $2 categoria, $3 massimo, $4 colore
     lw=$(( IW - 15 - barseg ))
     printf -v num '%2s' "$1"
     trunc "${LABEL[$c]}" "$lw"; rpad "$_t" "$lw"
-    lpad "$(human "${SIZE[$c]}")" 7; size=$_l
+    if [[ -n ${TIMEDOUT[$c]:-} ]]; then lpad "?" 7; else lpad "$(human "${SIZE[$c]}")" 7; fi
+    size=$_l
     lock=" "; (( SUDO[$c] )) && lock="${C_YLW}${G_LOCK}${RST}"
     if [[ -n $1 ]]; then
         bar=""; (( BARW )) && { gbar "${SIZE[$c]}" "$3" "$BARW"; bar="${_b}  "; }
@@ -753,7 +791,7 @@ preview() {
     for t in 1 2; do
         first=1
         for c in "${CATS[@]}"; do
-            (( TIER[$c] == t && SIZE[$c] > 0 )) || continue
+            (( TIER[$c] == t && (SIZE[$c] > 0 || ${TIMEDOUT[$c]:-0}) )) || continue
             if (( first )); then
                 if (( t == 1 )); then
                     title="${G_SHIELD} CONSIGLIATE · si rigenerano da sole"; col=$C_GRN

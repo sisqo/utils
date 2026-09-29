@@ -93,6 +93,11 @@ preview first. Nothing is deleted until you pick what to remove and confirm.
   the animations, `NO_COLOR=1` (or piping the output) drops the colors.
 - The preview lists every category with its size and what's inside (paths,
   snap revisions, log files, orphan packages). It needs no `sudo`.
+- Each category is sized in the background with a time limit
+  (`VMCLEAN_TIMEOUT`, 20s by default), showing which one it's working on. If a
+  command hangs (e.g. `snap list` while snapd or systemd isn't responding),
+  that category is marked as not responding and skipped instead of blocking
+  the whole scan.
 - **Recommended** categories are safely regenerable: npm/npx and pip caches,
   thumbnails, old Claude Code versions and installer downloads, the Claude
   Desktop and VS Code caches, leftover Chrome headless profiles, disabled snap
