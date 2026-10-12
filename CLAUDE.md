@@ -64,6 +64,12 @@ Current scripts:
 - `draw_full` redraws everything after a key press or resize; `draw_tick` only
   redraws the header (animated gradient, system info) and the status bar. The
   main loop's `read -t` timeout (0.1s while animating, 1s otherwise) is the tick.
+- Input: the tty stays `-icanon` for the whole TUI session (`tui_on` saves
+  `stty -g`, `tui_off` restores it). It's required by the main loop, which
+  drains already-queued keys with `read -t 0` before redrawing, so held arrows
+  compute the inspector only once; in canonical mode `read -t 0` never sees
+  them. On launch, keys arriving within 0.15s are discarded so they don't
+  answer the `session` prompt.
 - Pins and colors: `~/.config/cla2/projects` (TSV `name<TAB>digit<TAB>color`,
   keyed by folder name under `~/git`) is loaded into `CFG_PIN`/`CFG_COLOR`,
   which keep stale entries too. `apply_prefs` derives the per-index
